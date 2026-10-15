@@ -195,49 +195,74 @@ def clean_profile_locks(profile):
             pass
 
 
+# Chrome 启动参数。
+# ⚠️ 不要加 --disable-gpu：本游戏是 PixiJS/WebGL 画面，禁用它会让 Chrome 退化为
+# SwiftShader 软件渲染，1500x940@60fps 的战斗画面全部由 CPU 光栅化。
+# 实测（2026-10-15，战斗中，浏览器进程树）：
+#   带 --disable-gpu → 839% 单核（整机 52.4%），内存 1238→1802MB
+#   硬件加速        → 82% 单核（整机 5.1%），内存 917→1165MB
+# 即该项单独导致 CPU 高 10 倍。无显卡/驱动异常的环境由 launch_persistent 自动回退。
 CHROME_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--no-first-run",
     "--no-default-browser-check",
-    "--disable-gpu",
     "--mute-audio",
 ]
 VIEWPORT = {"width": 1500, "height": 940}
 
 
 def launch_persistent(pw, user_data_dir, headless=False):
-    """逐候选启动持久化 Chrome；每个候选重试 2 次。返回 (ctx, used_path)"""
+    """逐候选启动持久化 Chrome；每个候选重试 2 次。返回 (ctx, used_path)
+
+    GPU 回退：第一轮用硬件加速参数（CHROME_ARGS，不含 --disable-gpu）；
+    若所有候选都起不来，再加 --disable-gpu 重试一轮，兼容无显卡/驱动异常的环境。
+    """
     cands = chrome_candidates()
     if not cands:
         raise RuntimeError("未找到可用的 Chrome / Edge，请先安装 Google Chrome 或 Microsoft Edge")
-    errors = []
-    for exe, rank, name in cands:
-        for attempt in (1, 2):
-            try:
-                if attempt == 2:
-                    kill_stale_chrome(user_data_dir)
-                    clean_profile_locks(user_data_dir)
-                    time.sleep(2)
-                ctx = pw.chromium.launch_persistent_context(
-                    user_data_dir=user_data_dir, executable_path=exe, headless=headless,
-                    viewport=VIEWPORT, args=CHROME_ARGS,
-                    ignore_default_args=["--enable-automation"])
-                if ctx.pages:
-                    page = ctx.pages[0]
-                else:
-                    page = ctx.new_page()
+
+    def _try(args):
+        errs = []
+        for exe, rank, name in cands:
+            for attempt in (1, 2):
                 try:
-                    page.evaluate("1")
-                except Exception:
+                    if attempt == 2:
+                        kill_stale_chrome(user_data_dir)
+                        clean_profile_locks(user_data_dir)
+                        time.sleep(2)
+                    ctx = pw.chromium.launch_persistent_context(
+                        user_data_dir=user_data_dir, executable_path=exe, headless=headless,
+                        viewport=VIEWPORT, args=args,
+                        ignore_default_args=["--enable-automation"])
+                    if ctx.pages:
+                        page = ctx.pages[0]
+                    else:
+                        page = ctx.new_page()
                     try:
-                        ctx.close()
+                        page.evaluate("1")
                     except Exception:
-                        pass
-                    raise RuntimeError("context 启动后不可用（可能被已有浏览器实例接管）")
-                return ctx, exe
-            except Exception as e:
-                errors.append("%s(%s) 第%d次: %s" % (name, os.path.basename(exe), attempt, str(e)[:120]))
-                time.sleep(1)
+                        try:
+                            ctx.close()
+                        except Exception:
+                            pass
+                        raise RuntimeError("context 启动后不可用（可能被已有浏览器实例接管）")
+                    return ctx, exe
+                except Exception as e:
+                    errs.append("%s(%s) 第%d次: %s" % (name, os.path.basename(exe), attempt, str(e)[:120]))
+                    time.sleep(1)
+        return None, errs
+
+    # 第一轮：硬件加速（默认，CPU 友好）
+    ctx, res = _try(list(CHROME_ARGS))
+    if ctx is not None:
+        return ctx, res
+    errors = list(res)
+
+    # 第二轮：软件渲染兜底（无显卡/驱动异常的环境）
+    ctx, res = _try(list(CHROME_ARGS) + ["--disable-gpu"])
+    if ctx is not None:
+        return ctx, res
+    errors += list(res)
     raise RuntimeError("浏览器启动失败：\n" + "\n".join(errors[-6:]))
 
 
@@ -314,9 +339,11 @@ JS_HP_WATCH = r"""
       let best = null, bestScore = 0, bestName = '', bestKind = '';
       const seen = new Set();
       const queue = [...starts];
+      // 索引游标而非 queue.shift()：大数组 shift() 是 O(n)，整棵树最坏 O(n^2)
+      let qi = 0;
       let visited = 0;
-      while (queue.length && visited < 60000) {
-        const f = queue.shift(); visited++;
+      while (qi < queue.length && visited < 60000) {
+        const f = queue[qi++]; visited++;
         if (!f || seen.has(f)) continue;
         seen.add(f);
         res.fibers++;
