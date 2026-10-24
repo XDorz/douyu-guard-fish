@@ -34,7 +34,8 @@ HOME_URL = "https://www.douyu.com/"
 MAX_BATTLE_SECONDS = 13 * 60      # 单场最长等待（服务端上限 600s + 余量）
 TICK = 0.5                         # 状态轮询间隔
 IDLE_STUCK_LIMIT = 90              # 空闲态卡住多久后尝试恢复（刷新页面）
-PRE_BATTLE_LIMIT = 90              # 点挑战后等待开局的上限
+PRE_BATTLE_LIMIT = 90              # 点挑战后"无进展"超时（每有进展会重新计时）
+PRE_BATTLE_HARD_LIMIT = 300        # 点挑战后绝对上限（防止面板反复刷而无限等）
 
 
 def log_msg(*a):
@@ -612,11 +613,70 @@ JS_CLICK_SKILL = r"""
 
 JS_CLICK_FINAL_START = r"""
 () => {
-  const box = document.querySelector('[class*="Starter-module_skillList"]');
-  if (!box) return null;
-  const btn = box.querySelector('[class*="Starter-module_footer"] button') || box.querySelector('button');
-  if (btn) { btn.click(); return (btn.innerText || '').trim().slice(0, 40) || 'ok'; }
-  return null;
+  const vis = el => { if (!el) return false; const r = el.getBoundingClientRect();
+    const s = getComputedStyle(el);
+    return r.width > 1 && r.height > 1 && s.display !== 'none' && s.visibility !== 'hidden'; };
+  const T = el => (el.innerText || '').replace(/\s+/g, '').trim();
+  // 自身或内部真实按钮被禁用，都算不可点（外层 div 常是按钮的包装）
+  const off = el => {
+    if (el.disabled || el.getAttribute('aria-disabled') === 'true'
+        || /disabled/i.test(String(el.className || ''))) return true;
+    if (getComputedStyle(el).pointerEvents === 'none') return true;
+    const inner = el.querySelector && el.querySelector('button, [role="button"]');
+    return !!(inner && (inner.disabled || inner.getAttribute('aria-disabled') === 'true'));
+  };
+  const isBtn = el => el.matches('button, [role="button"]');
+  const clickable = el => isBtn(el)
+      || /btn|Btn|footer|Footer|confirm|Confirm|start|Start/.test(String(el.className || ''));
+
+  const list = document.querySelector('[class*="Starter-module_skillList"]');
+  if (!list) return {ok: false, why: 'no-skillList'};
+
+  // 技能卡本身要排除，其余可点元素都算候选（含 footer 容器，点击可冒泡）
+  const cand = root => [...root.querySelectorAll('button, [role="button"], [class*="footer"], [class*="Footer"], [class*="btn"], [class*="Btn"]')]
+      .filter(b => vis(b) && !b.closest('[class*="_skill-"]') && clickable(b));
+
+  // 面板根：footer 常是 skillList 的兄弟节点，逐层上溯
+  let scope = list, found = [], hops = 0;
+  while (scope && hops < 6) {
+    found = cand(scope);
+    if (found.length) break;
+    scope = scope.parentElement; hops++;
+  }
+
+  // 全页兜底（弹窗可能挂在 body 下）
+  const all = [...document.querySelectorAll('button, [role="button"]')]
+      .filter(b => vis(b) && !b.closest('[class*="_skill-"]'));
+
+  // 前缀匹配优先；再退化到包含匹配（应对「点击开始」这类文案）
+  const KEY = [/^开始/, /^确认/, /^确定/, /出战/, /进入战斗/, /^战斗/, /^立即/,
+               /开始/, /确认/, /出战/, /进入/];
+
+  // 优先真实 <button>；容器元素只在找不到按钮时兜底，避免选中包装层而漏判 disabled
+  const choose = arr => {
+    const real = arr.filter(isBtn);
+    for (const re of KEY) { const b = real.find(x => re.test(T(x))); if (b) return {b: b, how: 'text'}; }
+    const f = real.find(x => /footer/i.test(String(x.className || '')));
+    if (f) return {b: f, how: 'footer'};
+    for (const re of KEY) { const b = arr.find(x => re.test(T(x))); if (b) return {b: b, how: 'text-wrapper'}; }
+    if (real.length === 1) return {b: real[0], how: 'single'};
+    if (arr.length === 1) return {b: arr[0], how: 'single-wrapper'};
+    return {b: null, how: null};
+  };
+
+  let {b: btn, how} = choose(found);
+  if (!btn) { const p = choose(all); btn = p.b; how = p.how ? 'page-' + p.how : null; }
+
+  const dump = arr => [...new Set(arr)].slice(0, 6).map(b =>
+      b.tagName + '|' + T(b).slice(0, 16) + '|' + String(b.className || '').slice(0, 34));
+
+  if (!btn) return {ok: false, why: 'no-button', hops: hops,
+                    panelCls: String((scope && scope.className) || '').slice(0, 90),
+                    seen: dump(found.concat(all))};
+  if (off(btn)) return {ok: false, why: 'disabled', how: how, text: T(btn).slice(0, 24),
+                        seen: dump(found.concat(all))};
+  try { btn.click(); } catch (e) { return {ok: false, why: 'click-threw:' + String(e).slice(0, 60)}; }
+  return {ok: true, how: how, text: T(btn).slice(0, 24) || 'ok'};
 }
 """
 
@@ -1046,10 +1106,26 @@ class GuardFishBot:
         clicks = 1
 
         # c) 开局等待：处理面板/弹窗；仍停在主页面则重试点击（点击可能落在按钮就绪前）
+        #    超时用「无进展窗口」而非固定总时长：技能三选一/确认列表变化都算进展，
+        #    避免技能多、面板刷新慢时被固定 90 秒误判失败。
         t0 = time.time()
-        while time.time() - t0 < PRE_BATTLE_LIMIT:
+        last_progress = t0
+        last_final_txt = None
+        last_final_click = 0.0
+        final_fail_why = ""
+        while True:
             if self._stop.is_set():
                 return False, info
+            if time.time() - t0 > PRE_BATTLE_HARD_LIMIT:
+                self._log("开局超时（已达绝对上限 %ds）" % PRE_BATTLE_HARD_LIMIT, "warn")
+                break
+            if time.time() - last_progress > PRE_BATTLE_LIMIT:
+                if last_final_txt is not None:
+                    self._log("开局超时：技能确认列表停在本页 %ds 未能开始（%s）"
+                              % (PRE_BATTLE_LIMIT, final_fail_why or "原因未知"), "warn")
+                else:
+                    self._log("开局超时：%ds 内无任何进展" % PRE_BATTLE_LIMIT, "warn")
+                break
             time.sleep(0.8)
             st = self._state()
             if not st:
@@ -1059,6 +1135,7 @@ class GuardFishBot:
             if st.get("limitAlter"):
                 self._click(JS_CLOSE_LIMIT_ALTER)
                 self._log("卡组不足提示：需要 9 张出战卡（请到编队里配满）", "warn")
+                last_progress = time.time()
                 time.sleep(1)
                 continue
 
@@ -1071,13 +1148,34 @@ class GuardFishBot:
                 got = self._click(JS_CLICK_SKILL, best)
                 if got:
                     info["skills"].append({"text": texts[best][:80], "score": max(scores)})
+                last_progress = time.time()
                 time.sleep(2.0)
                 continue
 
             if st.get("finalSkillList"):
-                self._log("技能确认列表：%s" % (st.get("finalSkillList") or "")[:120])
-                self._click(JS_CLICK_FINAL_START)
-                time.sleep(2.5)
+                txt = st.get("finalSkillList") or ""
+                if txt != last_final_txt:
+                    last_final_txt = txt
+                    last_progress = time.time()
+                    self._log("技能确认列表：%s" % txt[:120])
+                # 点击「开始战斗」：带冷却，避免每 0.8s 狂点；并校验返回结果
+                if time.time() - last_final_click > 3.0:
+                    last_final_click = time.time()
+                    r = self._click(JS_CLICK_FINAL_START)
+                    if isinstance(r, dict):
+                        if r.get("ok"):
+                            self._log("已点击开始战斗（%s · %s）" % (r.get("text") or "", r.get("how") or ""))
+                            last_progress = time.time()
+                        else:
+                            final_fail_why = str(r.get("why") or "?")
+                            seen = r.get("seen") or []
+                            self._log("技能确认列表未能开始：%s；面板=%s；候选=%s"
+                                      % (final_fail_why, (r.get("panelCls") or "")[:60], seen),
+                                      "warn")
+                    else:
+                        final_fail_why = "no-skillList"
+                        self._log("技能确认列表未能开始：页面未找到 Starter-module_skillList", "warn")
+                time.sleep(1.0)
                 continue
 
             if st.get("inBattle"):
@@ -1094,6 +1192,7 @@ class GuardFishBot:
                 if r2:
                     clicks += 1
                     last_click = time.time()
+                    last_progress = time.time()
                     self._log("再次点击「开启挑战」（重试第 %d 次）" % clicks)
 
         return False, info
@@ -1274,7 +1373,11 @@ class GuardFishBot:
                 continue
             if st.get("finalSkillList"):
                 r = self._click(JS_CLICK_FINAL_START)
-                self._log("残留的技能确认列表 → %s" % r)
+                if isinstance(r, dict) and r.get("ok"):
+                    self._log("残留的技能确认列表 → 已点开始战斗（%s）" % (r.get("text") or ""))
+                else:
+                    self._log("残留的技能确认列表 → 未能开始（%s）"
+                              % ((r or {}).get("why") if isinstance(r, dict) else "no-skillList"), "warn")
                 time.sleep(1.5)
                 continue
             break
