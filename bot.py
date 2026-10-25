@@ -298,10 +298,11 @@ FAKE_DEVTOOLS_HOOK = r"""
 JS_HP_WATCH = r"""
 (() => {
   if (window.__GF) return 'exists';
-  const GF = window.__GF = {enabled: true, threshold: 5, refills: 0, hpEvents: [], hp: null,
+  const GF = window.__GF = {enabled: true, hpGuard: true, threshold: 5, refills: 0, hpEvents: [], hp: null,
                             mgrRef: null, loopRef: null, wrapped: false, foundOnce: false,
                             fullHp: 0,
                             battleT0: 0, maxRefillMs: 540000, capped: false,
+                            oneHit: false, oneHitKills: 0, oneHitWrapped: false,
                             scanCount: 0, scanInfo: null, diag: null, err: null, comp: ''};
   // 解析：ref.current 可能是 BattleLoop（直接含 coreHp）或 BattleManager（显示层，coreHp 在 .loop 里）
   function resolveTarget(c) {
@@ -385,6 +386,7 @@ JS_HP_WATCH = r"""
   window.__gfScan = scanTree;
   function refill(loop, tag) {
     try {
+      if (!GF.hpGuard) return;
       if (!loop || typeof loop.coreHp !== 'number') return;
       if (loop.running === false) return;
       // 回血时间上限：单场接近服务端 600 秒上限时主动停手，让战斗自然结束
@@ -444,6 +446,27 @@ JS_HP_WATCH = r"""
           }
         } catch (e) { GF.err = String(e); }
       }
+      // 秒杀：包装 _dealDamage，把本次伤害抬到「恰好等于敌人当前血量」。
+      // 原实现 actualDmg = min(max(1,floor(damage)), enemy.currentHp)，因此传 currentHp
+      // 必然打成 0 → 走原生的 _killEnemy（伤害统计/击杀回调/掉落/清关判定全部保留）。
+      if (!loop.__gfOneHitWrapped) {
+        try {
+          const proto2 = Object.getPrototypeOf(loop);
+          const orig2 = loop._dealDamage || (proto2 && proto2._dealDamage);
+          if (typeof orig2 === 'function') {
+            loop._dealDamage = function (enemy, damage, cardId, isCrit) {
+              try {
+                if (GF.oneHit && enemy && typeof enemy.currentHp === 'number' && enemy.currentHp > 0) {
+                  GF.oneHitKills++;
+                  return orig2.call(this, enemy, enemy.currentHp, cardId, isCrit);
+                }
+              } catch (e) { GF.err = String(e); }
+              return orig2.call(this, enemy, damage, cardId, isCrit);
+            };
+            loop.__gfOneHitWrapped = true; GF.oneHitWrapped = true;
+          }
+        } catch (e) { GF.err = String(e); }
+      }
       const hp = loop.coreHp;
       const stageMax2 = (loop.config && loop.config.battle && loop.config.battle.baseCoreHp) || 20;
       if (stageMax2 > (GF.fullHp || 0)) GF.fullHp = stageMax2;
@@ -461,9 +484,14 @@ JS_HP_WATCH = r"""
 JS_HP_CFG = r"""
 (cfg) => {
   if (!window.__GF) return false;
-  if (cfg && cfg.enabled !== undefined) window.__GF.enabled = !!cfg.enabled;
+  if (cfg && cfg.enabled !== undefined) window.__GF.hpGuard = !!cfg.enabled;   // 兼容旧参数名
+  if (cfg && cfg.hpGuard !== undefined) window.__GF.hpGuard = !!cfg.hpGuard;
   if (cfg && cfg.threshold !== undefined) window.__GF.threshold = Number(cfg.threshold) || 5;
-  return {enabled: window.__GF.enabled, threshold: window.__GF.threshold};
+  if (cfg && cfg.oneHit !== undefined) window.__GF.oneHit = !!cfg.oneHit;
+  // 守护循环（250ms）只要「回血」或「秒杀」有一个开着就要跑
+  window.__GF.enabled = !!(window.__GF.hpGuard || window.__GF.oneHit);
+  return {hpGuard: window.__GF.hpGuard, enabled: window.__GF.enabled,
+          threshold: window.__GF.threshold, oneHit: window.__GF.oneHit};
 }
 """
 
@@ -474,6 +502,8 @@ JS_HP_DRAIN = r"""
   const ev = gf.hpEvents ? gf.hpEvents.splice(0, 200) : [];
   return {refills: gf.refills || 0, wrapped: !!gf.wrapped, found: !!gf.mgrRef,
           comp: gf.comp || '', hp: gf.hp,
+          oneHit: !!gf.oneHit, oneHitWrapped: !!gf.oneHitWrapped,
+          oneHitKills: gf.oneHitKills || 0,
           scanInfo: gf.scanInfo, err: gf.err, events: ev};
 }
 """
@@ -781,7 +811,7 @@ def score_skill_text(txt):
 class GuardFishBot:
     def __init__(self, rid=DEFAULT_RID, rounds=10, gap_min=5, gap_max=15,
                  headless=False, claim_weekpass=True, on_log=None,
-                 hp_guard=True, hp_threshold=5, coin_play=True):
+                 hp_guard=True, hp_threshold=5, coin_play=True, one_hit=False):
         self.rid = str(rid)
         self.rounds = int(rounds)
         self.gap_min = float(gap_min or 0)
@@ -791,6 +821,8 @@ class GuardFishBot:
         self.hp_guard = bool(hp_guard)
         self.hp_threshold = int(hp_threshold or 5)
         self.coin_play = bool(coin_play)          # 免费用尽后用银币续打（银币为免费获取）
+        self.one_hit = bool(one_hit)              # 秒杀模式：我方卡牌造成的伤害直接击杀
+        self._one_hit_kills = 0
         self._battle_paid = "free"                # free / coin
 
         self._stop = threading.Event()
@@ -879,13 +911,15 @@ class GuardFishBot:
             pass
 
     def _apply_hp_config(self):
-        """把回血配置同步到页面（enabled/threshold）"""
+        """把回血/秒杀配置同步到页面"""
         try:
-            r = self._page.evaluate(JS_HP_CFG, {"enabled": self.hp_guard,
-                                                "threshold": self.hp_threshold})
+            r = self._page.evaluate(JS_HP_CFG, {"hpGuard": self.hp_guard,
+                                                "threshold": self.hp_threshold,
+                                                "oneHit": self.one_hit})
             if r:
-                self._log("回血守护：%s（阈值 < %s 回满）"
-                          % ("开" if r.get("enabled") else "关", r.get("threshold")))
+                self._log("回血守护：%s（阈值 < %s 回满）｜秒杀模式：%s"
+                          % ("开" if r.get("hpGuard") else "关", r.get("threshold"),
+                             "开" if r.get("oneHit") else "关"))
             return r
         except Exception:
             return None
@@ -1099,7 +1133,7 @@ class GuardFishBot:
             return False, info
         # 标记本场开始时间（回血守护据此在 9 分钟时收手，避免撞服务端 600 秒上限）
         try:
-            self._page.evaluate("() => { if (window.__GF) { window.__GF.battleT0 = Date.now(); window.__GF.capped = false; } }")
+            self._page.evaluate("() => { if (window.__GF) { window.__GF.battleT0 = Date.now(); window.__GF.capped = false; window.__GF.oneHitKills = 0; } }")
         except Exception:
             pass
         last_click = time.time()
@@ -1311,6 +1345,7 @@ class GuardFishBot:
                     "freeNum": r.get("freeNum"), "boxes": r.get("boxes"),
                     "result": r.get("resultText"), "skills": r.get("skills"),
                     "refills": r.get("refills"), "hpMin": r.get("hpMin"),
+                    "oneHitKills": r.get("oneHitKills"),
                     "ended": r.get("ended"),
                 })
                 self._log("战报：起始第%s关 → 到达第%s关，用时 %.0f 秒，回血 %s 次，%s%s"
@@ -1449,6 +1484,9 @@ class GuardFishBot:
                     self._log("回血守护已接管（%s）" % (gf.get("comp") or "engine"))
                 if gf.get("err"):
                     self._log("回血守护异常：%s" % str(gf.get("err"))[:120], "warn")
+                if gf.get("oneHitKills") is not None:
+                    self._one_hit_kills = int(gf.get("oneHitKills") or 0)
+                    self.status["one_hit_kills"] = self._one_hit_kills
                 for ev in (gf.get("events") or []):
                     if ev.get("type") == "refill":
                         hp_refill_count += 1
@@ -1500,9 +1538,10 @@ class GuardFishBot:
             self.status["refills"] = hp_refill_count
             if el - last_hud >= 60:
                 last_hud = el
-                self._log("进行中 t=%ss 第%s关 HP=%s 免费剩余=%s 回血=%d"
+                self._log("进行中 t=%ss 第%s关 HP=%s 免费剩余=%s 回血=%d%s"
                           % (el, stage.get("curStage", "?"), stage.get("curHp", "?"),
-                             wm.get("freeNum", "?"), hp_refill_count))
+                             wm.get("freeNum", "?"), hp_refill_count,
+                             (" 秒杀=%d" % self._one_hit_kills) if self.one_hit else ""))
 
             # 3.1 结算（只有真正的结算弹窗才算本场结束；宝箱弹窗不算）
             if st.get("result") or st.get("treasure"):
@@ -1600,6 +1639,7 @@ class GuardFishBot:
             "paid": self._battle_paid,
             "resultText": result_text,
             "skills": skills_chosen,
+            "oneHitKills": self._one_hit_kills,
             "refills": hp_refill_count,
             "hpMin": hp_min,
             "hpTimeline": hp_timeline,
@@ -1724,6 +1764,7 @@ def main():
     ap.add_argument("--no-hp", action="store_true", help="关闭「血量低于阈值自动回满」")
     ap.add_argument("--hp-threshold", type=int, default=5, help="回血阈值（血量低于该值回满，默认 5）")
     ap.add_argument("--no-coin", action="store_true", help="免费用尽后不用银币续打（默认会用，银币为免费获取）")
+    ap.add_argument("--one-hit", action="store_true", help="秒杀模式：我方卡牌伤害直接击杀怪物")
     args = ap.parse_args()
 
     if args.selftest:
@@ -1747,9 +1788,11 @@ def main():
                            gap_min=args.gap_min, gap_max=args.gap_max,
                            headless=args.headless, claim_weekpass=not args.no_claim,
                            hp_guard=not args.no_hp, hp_threshold=args.hp_threshold,
-                           coin_play=not args.no_coin)
+                           coin_play=not args.no_coin, one_hit=args.one_hit)
         bot.add_log_sink(sink)
-        bot._log("命令行挂机启动：房间=%s 场数=%d%s" % (args.rid, args.rounds, " [headless]" if args.headless else ""))
+        bot._log("命令行挂机启动：房间=%s 场数=%d%s%s" % (args.rid, args.rounds,
+                 " [headless]" if args.headless else "",
+                 " [秒杀模式]" if args.one_hit else ""))
         bot.start()
         try:
             while bot._thread and bot._thread.is_alive():
@@ -1764,6 +1807,9 @@ def main():
     print("用法：")
     print("  --login          打开浏览器登录斗鱼（首次/掉登录后）")
     print("  --run            命令行挂机（--rounds N --rid 12306 --headless）")
+    print("  --one-hit        秒杀模式：我方卡牌伤害直接击杀怪物")
+    print("  --no-hp          关闭血量低于阈值自动回满")
+    print("  --no-coin        免费用尽后不用银币续打")
     print("  --selftest       环境自检")
     print("图形界面请运行「保卫鱼娘助手.exe」或 gui.py")
 

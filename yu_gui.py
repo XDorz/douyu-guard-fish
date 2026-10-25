@@ -76,6 +76,12 @@ class App:
         ttk.Checkbutton(top, text="免费用尽后用银币续打（银币免费获得）",
                         variable=self.coin_var).grid(row=1, column=4, columnspan=5, sticky="w", pady=(8, 0))
 
+        # 秒杀模式：我方 9 张卡造成的任何伤害直接击杀怪物
+        self.one_hit_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(top, text="秒杀模式（卡牌伤害直接击杀）",
+                        variable=self.one_hit_var).grid(row=1, column=9, columnspan=4,
+                                                        sticky="w", pady=(8, 0))
+
         self.headless_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(top, text="后台运行(隐藏浏览器)", variable=self.headless_var).grid(row=0, column=8, padx=(0, 14))
 
@@ -197,18 +203,22 @@ class App:
         if self.hp_var.get():
             self._log("[系统] 回血守护：开（血量 < %d 自动回满）" % hp_th)
         self._log("[系统] 银币续打：%s" % ("开（免费用尽后银币≥10 自动继续）" if self.coin_var.get() else "关"))
+        if self.one_hit_var.get():
+            self._log("[系统] 秒杀模式：开（我方卡牌造成的任何伤害直接击杀怪物）")
         self.thread = threading.Thread(target=self._run,
                                        args=(rid, rounds, gap_min, gap_max, self.headless_var.get(),
-                                             self.hp_var.get(), hp_th, self.coin_var.get()),
+                                             self.hp_var.get(), hp_th, self.coin_var.get(),
+                                             self.one_hit_var.get()),
                                        daemon=True)
         self.thread.start()
 
-    def _run(self, rid, rounds, gap_min, gap_max, headless, hp_guard, hp_th, coin_play):
+    def _run(self, rid, rounds, gap_min, gap_max, headless, hp_guard, hp_th, coin_play,
+             one_hit=False):
         try:
             self.bot = botmod.GuardFishBot(rid=rid, rounds=rounds, gap_min=gap_min,
                                            gap_max=gap_max, headless=headless,
                                            hp_guard=hp_guard, hp_threshold=hp_th,
-                                           coin_play=coin_play)
+                                           coin_play=coin_play, one_hit=one_hit)
             self.bot.add_log_sink(lambda line, level=None: LOG_Q.put((line, level)))
             self.bot.start()
             self.bot._thread.join()
