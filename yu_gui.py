@@ -15,6 +15,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 import bot as botmod  # noqa: E402
 import settings
+from combat_ui import CombatWidgets
 
 LOG_Q = queue.Queue()
 FONT = ("Microsoft YaHei UI", 10)
@@ -37,8 +38,8 @@ class App:
         self.bot = None
         root.title("保卫鱼娘 · 自动挂机助手 v%s%s" %
                    (botmod.APP_VERSION, " · Debug" if self.debug else ""))
-        root.geometry("1160x720")
-        root.minsize(1040, 600)
+        root.geometry("1240x820")
+        root.minsize(1100, 740)
         self._build()
         self._load_config()
         self._log("[系统] 就绪。首次使用请先点「登录斗鱼」登录账号（登录态保存在本机）。")
@@ -99,7 +100,9 @@ class App:
                         variable=self.coin_var).pack(side="left", padx=(0, 20))
 
         # 秒杀策略：默认保留原来的全额秒杀，也可切换成概率或攻击倍率。
-        one_hit_frame = ttk.Frame(options)
+        combat_row = ttk.Frame(top)
+        combat_row.grid(row=3, column=0, sticky="w", pady=(8, 0))
+        one_hit_frame = ttk.Frame(combat_row)
         one_hit_frame.pack(side="left")
         self.one_hit_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(one_hit_frame, text="秒杀",
@@ -121,6 +124,8 @@ class App:
         self.one_hit_unit = ttk.Label(one_hit_frame, text="", font=FONT_S, foreground="#666")
         self.one_hit_unit.pack(side="left")
         self._update_one_hit_mode_ui()
+        self.combat_widgets = CombatWidgets(self.root, self._combat_controls_changed, FONT, FONT_S)
+        self.combat_widgets.build_speed(combat_row)
 
         self.headless_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(header, text="后台运行(隐藏浏览器)", variable=self.headless_var).grid(row=0, column=8, padx=(0, 14))
@@ -147,7 +152,7 @@ class App:
         self.advance_stages = tk.StringVar(value="0")
         self.max_minutes = tk.StringVar(value="13")
         target_row = ttk.Frame(top)
-        target_row.grid(row=3, column=0, sticky="w", pady=(8, 0))
+        target_row.grid(row=4, column=0, sticky="w", pady=(8, 0))
 
         def target_group(title, variable, suffix):
             group = ttk.Frame(target_row)
@@ -160,20 +165,25 @@ class App:
         target_group("推进", self.advance_stages, "关后结束（0=关）")
         target_group("单场最长", self.max_minutes, "分钟")
 
-        tips = ttk.Label(top, text="‘本场正常结束’：1 血、随机 1–100 伤害收尾，随后继续下一场。"
+        tips = ttk.Label(top, text="‘本场正常结束’：1 血并暂停新攻击，随后继续下一场。"
                                    "‘暂时停止’：收尾回主界面，保留计数等待恢复。‘终止并退出’：关闭浏览器。\n"
                                    "免费用尽后可用银币续打；绝技、加速等鱼翅付费按钮不会自动点击。",
                          font=FONT_S, foreground="#666", wraplength=1000)
-        tips.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        tips.grid(row=5, column=0, sticky="w", pady=(8, 0))
         top.bind("<Configure>", lambda e: tips.configure(wraplength=max(300, e.width - 20)))
 
         self.status = tk.StringVar(value="状态：未运行")
         ttk.Label(self.root, textvariable=self.status, anchor="w", padding=(10, 5),
                   background="#f0f0f0", font=FONT_B).pack(fill="x", pady=(6, 0))
 
-        frame = ttk.Frame(self.root, padding=(10, 8, 10, 10))
-        frame.pack(fill="both", expand=True)
-        self.text = tk.Text(frame, wrap="none", height=22, font=("Consolas", 10))
+        panes = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, sashwidth=6, bd=0)
+        panes.pack(fill="both", expand=True)
+        frame = ttk.Frame(panes, padding=(10, 8, 0, 10))
+        sidebar = ttk.Frame(panes, padding=(4, 8, 10, 10))
+        panes.add(frame, minsize=440, stretch="always")
+        panes.add(sidebar, minsize=310, width=340, stretch="never")
+        self.combat_widgets.build_effects(sidebar)
+        self.text = tk.Text(frame, wrap="word", height=22, font=("Consolas", 10))
         sb = ttk.Scrollbar(frame, command=self.text.yview)
         self.text.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
@@ -197,6 +207,8 @@ class App:
         self._settings, error = settings.load(botmod.CONFIG_PATH)
         for key, var in self._config_vars().items():
             var.set(self._settings[key])
+        self.combat_widgets.set_controls(self._settings["combat"])
+        self._desired_combat = self.combat_widgets.values()
         mode = self._settings["one_hit_mode"]
         self.one_hit_mode.set(dict((key, label) for label, key in ONE_HIT_MODE_LABELS)[mode])
         self._last_one_hit_mode = mode
@@ -219,6 +231,7 @@ class App:
             self.root.after_cancel(self._save_job)
             self._save_job = None
         values = {key: var.get() for key, var in self._config_vars().items()}
+        values["combat"] = self.combat_widgets.values()
         mode = self._one_hit_mode_key()
         if mode in self._mode_values:
             self._mode_values[mode] = self.one_hit_value.get()
@@ -324,7 +337,7 @@ class App:
             self.one_hit_unit.config(text="倍")
             self.one_hit_value_entry.config(state="normal")
         else:
-            self.one_hit_unit.config(text="（参数无效）")
+            self.one_hit_unit.config(text="")
             self.one_hit_value_entry.config(state="disabled")
 
     def _one_hit_mode_changed(self, _event=None):
@@ -337,6 +350,12 @@ class App:
             self._last_one_hit_mode = mode
         self._update_one_hit_mode_ui()
         self._runtime_options_changed()
+
+    def _combat_controls_changed(self, values):
+        self._desired_combat = values
+        self._schedule_config_save()
+        if self.running and self.bot:
+            self.bot.set_runtime_controls(combat_controls=values)
 
     def _runtime_options_changed(self):
         """复选框点击后通知运行线程；Playwright 调用仍在机器人线程中执行。"""
@@ -406,6 +425,8 @@ class App:
             self.gap_min.set("%g" % gap_min)
             self.gap_max.set("%g" % gap_max)
 
+        self.combat_widgets.flush()
+        self._desired_combat = self.combat_widgets.values()
         self._save_config()
         self.bot = None
         self.running = True
@@ -454,13 +475,15 @@ class App:
                                            one_hit_mode=one_hit_mode,
                                            one_hit_probability=one_hit_probability,
                                            attack_multiplier=attack_multiplier,
-                                           debug=self.debug, pause_on_timeout=True)
+                                           debug=self.debug, pause_on_timeout=True,
+                                           combat_controls=self._desired_combat)
             # 如果用户在工作线程刚启动的瞬间点击了复选框，以当前 GUI 值为准。
             self.bot.set_runtime_controls(hp_guard=self._desired_hp_guard,
                                           one_hit=self._desired_one_hit,
                                           one_hit_mode=self._desired_one_hit_mode,
                                           one_hit_probability=self._desired_one_hit_probability,
-                                          attack_multiplier=self._desired_attack_multiplier)
+                                          attack_multiplier=self._desired_attack_multiplier,
+                                          combat_controls=self._desired_combat)
             self.bot.add_log_sink(lambda line, level=None: LOG_Q.put((line, level)))
             self.bot.start()
             self.bot._thread.join()
@@ -527,6 +550,7 @@ class App:
             if not messagebox.askokcancel("退出", "挂机还在运行，确定退出？\n（战斗中退出会导致当前一场作废）"):
                 return
             self.bot.request_stop()
+        self.combat_widgets.close()
         self._save_config()
         self.root.destroy()
 

@@ -7,7 +7,7 @@
 
 原则（用户红线）：
   - 只做免费操作；任何涉及鱼翅/礼物（绝技/加速/技能刷新/银币兑换/充值）一律不自动点击
-  - battle 进行中绝不刷新页面
+  - 仅在持续无战斗活动的看门狗超时后刷新恢复；未确认结算不计场
 
 数据抓包：
   - logs/api_<date>.jsonl     所有 /actgame/** 接口原始响应
@@ -27,6 +27,8 @@ import traceback
 import datetime
 from stage_timing import StageTimer, api_stage
 from diagnostics import DebugRecorder, JS_ENGINE_SNAPSHOT, safe_api_data
+from combat_controls import (JS_COMBAT_INSTALL, JS_COMBAT_SNAPSHOT, KillStats, ActivityWatch,
+                             default_controls, normalize_controls, EFFECTS, EFFECT_LABELS)
 
 APP_NAME = "保卫鱼娘挂机助手"
 try:
@@ -315,7 +317,7 @@ JS_HP_WATCH = r"""
                             battleT0: 0, maxRefillMs: 540000, capped: false,
                             oneHit: false, oneHitMode: 'full', oneHitProbability: 50,
                             attackMultiplier: 2, oneHitKills: 0, oneHitWrapped: false,
-                            discover: false, endRequested: false, endApplied: false, finishing: false, endLoop: null,
+                            monitor: false, discover: false, endRequested: false, endApplied: false, finishing: false, endLoop: null,
                             intervalId: null, wrappedLoops: [],
                             scanCount: 0, scanInfo: null, diag: null, err: null, comp: ''};
   // 解析：ref.current 可能是 BattleLoop（直接含 coreHp）或 BattleManager（显示层，coreHp 在 .loop 里）
@@ -398,8 +400,7 @@ JS_HP_WATCH = r"""
     return res;
   }
   window.__gfScan = scanTree;
-  function restoreLoop(loop) {
-    if (!loop) return;
+  function restoreCheck(loop) {
     try {
       if (loop.__gfCheckHadOwn) loop._checkEnemiesReachedCore = loop.__gfCheckOriginal;
       else if (loop.__gfWrapped) delete loop._checkEnemiesReachedCore;
@@ -407,6 +408,8 @@ JS_HP_WATCH = r"""
       delete loop.__gfCheckHadOwn;
       delete loop.__gfWrapped;
     } catch (e) {}
+  }
+  function restoreDamage(loop) {
     try {
       if (loop.__gfDealHadOwn) loop._dealDamage = loop.__gfDealOriginal;
       else if (loop.__gfOneHitWrapped) delete loop._dealDamage;
@@ -414,6 +417,13 @@ JS_HP_WATCH = r"""
       delete loop.__gfDealHadOwn;
       delete loop.__gfOneHitWrapped;
     } catch (e) {}
+  }
+  function restoreLoop(loop) {
+    if (!loop) return;
+    restoreCheck(loop);
+    restoreDamage(loop);
+    if (window.__gfCombat) window.__gfCombat.restore(loop);
+    GF.wrappedLoops = GF.wrappedLoops.filter(x => x !== loop);
   }
   window.__gfRestoreLoop = restoreLoop;
   // 只包装伤害入口；落点、击杀、掉落和结算仍由原引擎处理。
@@ -455,6 +465,7 @@ JS_HP_WATCH = r"""
       GF.hpGuard = false;
       GF.oneHit = false;
       GF.finishing = true;
+      if (window.__gfCombat) window.__gfCombat.sync(loop);
       wrapDamage(loop);
       const before = loop.coreHp;
       loop.coreHp = 1;
@@ -525,7 +536,11 @@ JS_HP_WATCH = r"""
       }
       if (!t || typeof t.loop.coreHp !== 'number') return;
       const loop = t.loop;
+      if (GF.loopRef && GF.loopRef !== loop) restoreLoop(GF.loopRef);
       GF.loopRef = loop;
+      if (window.__gfCombat) window.__gfCombat.sync(loop);
+      if (!GF.hpGuard) restoreCheck(loop);
+      if (!GF.oneHit && !GF.finishing) restoreDamage(loop);
       if (GF.endRequested || (GF.finishing && (GF.endLoop !== loop || loop.coreHp > 1)))
         forceEnd(loop, 'watch');
       if (!GF.battleT0) { GF.battleT0 = Date.now(); GF.capped = false; }
@@ -581,9 +596,11 @@ JS_HP_CFG = r"""
   if (cfg && cfg.attackMultiplier !== undefined)
     window.__GF.attackMultiplier = Math.max(0.01, Number(cfg.attackMultiplier) || 1);
   if (cfg && cfg.discover !== undefined) window.__GF.discover = !!cfg.discover;
+  if (cfg && cfg.monitor !== undefined) window.__GF.monitor = !!cfg.monitor;
+  if (cfg && window.__gfCombat) window.__gfCombat.configure(cfg.combat, cfg.monitorEpoch);
   if (cfg && cfg.maxRefillMs !== undefined) window.__GF.maxRefillMs = Math.max(0, Number(cfg.maxRefillMs) || 0);
   // 守护循环（250ms）只要功能开启、正在寻找引擎或等待结束就运行
-  window.__GF.enabled = !!(window.__GF.hpGuard || window.__GF.oneHit || window.__GF.discover || window.__GF.endRequested || window.__GF.finishing);
+  window.__GF.enabled = !!(window.__GF.hpGuard || window.__GF.oneHit || window.__GF.monitor || window.__GF.discover || window.__GF.endRequested || window.__GF.finishing);
   return {hpGuard: window.__GF.hpGuard, enabled: window.__GF.enabled,
           threshold: window.__GF.threshold, oneHit: window.__GF.oneHit,
           oneHitMode: window.__GF.oneHitMode,
@@ -607,9 +624,9 @@ JS_HP_UNLOAD = r"""
   if (!gf) return {ok: true, unloaded: false};
   try { gf.enabled = false; gf.endRequested = false; gf.finishing = false; } catch (e) {}
   try { if (gf.intervalId) clearInterval(gf.intervalId); } catch (e) {}
-  try { for (const loop of (gf.wrappedLoops || [])) { if (typeof window.__gfRestoreLoop === 'function') window.__gfRestoreLoop(loop); } } catch (e) {}
+  try { for (const loop of [...(gf.wrappedLoops || [])]) { if (typeof window.__gfRestoreLoop === 'function') window.__gfRestoreLoop(loop); } } catch (e) {}
   try { if (window.__GF_CREATED_REACT_HOOK__) delete window.__REACT_DEVTOOLS_GLOBAL_HOOK__; delete window.__GF_CREATED_REACT_HOOK__; } catch (e) {}
-  try { delete window.__gfScan; delete window.__gfRefill; delete window.__gfRequestEnd; delete window.__gfRestoreLoop; delete window.__GF; } catch (e) {}
+  try { delete window.__gfScan; delete window.__gfRefill; delete window.__gfRequestEnd; delete window.__gfRestoreLoop; delete window.__gfCombat; delete window.__GF; } catch (e) {}
   return {ok: true, unloaded: true};
 }
 """
@@ -632,6 +649,7 @@ JS_HP_DRAIN = r"""
           oneHitKills: gf.oneHitKills || 0,
           endRequested: !!gf.endRequested, endApplied: !!gf.endApplied,
           finishing: !!gf.finishing, progress,
+          combat: window.__gfCombat ? window.__gfCombat.snapshot() : null,
           scanInfo: gf.scanInfo, err: gf.err, events: ev};
 }
 """
@@ -966,7 +984,7 @@ class GuardFishBot:
                  max_battle_seconds=MAX_BATTLE_SECONDS, stop_stage=0,
                  advance_stages=0, one_hit_mode="full",
                  one_hit_probability=50.0, attack_multiplier=2.0, debug=False,
-                 pause_on_timeout=False):
+                 pause_on_timeout=False, combat_controls=None):
         self.rid = str(rid)
         self.rounds = int(rounds)
         self.gap_min = float(gap_min or 0)
@@ -985,6 +1003,11 @@ class GuardFishBot:
         self.advance_stages = max(int(advance_stages or 0), 0)  # 从起始关推进的关卡数，0=关闭
         self.debug = bool(debug)
         self.pause_on_timeout = bool(pause_on_timeout)
+        self.combat_controls = normalize_controls(combat_controls)
+        self._runtime_epoch = 0
+        self._kills = KillStats()
+        self._pending_stage_records = []
+        self._recovery_attempts = 0
         self._debug_recorder = None
         self._debug_failed = False
         self._debug_last_capture = None
@@ -1040,7 +1063,7 @@ class GuardFishBot:
 
     def set_runtime_controls(self, hp_guard=None, one_hit=None, hp_threshold=None,
                              one_hit_mode=None, one_hit_probability=None,
-                             attack_multiplier=None):
+                             attack_multiplier=None, combat_controls=None):
         """更新运行中的回血/秒杀开关；实际页面操作由机器人线程执行。"""
         with self._control_lock:
             if hp_guard is not None:
@@ -1055,6 +1078,8 @@ class GuardFishBot:
                 self.one_hit_probability = max(0.0, min(float(one_hit_probability), 100.0))
             if attack_multiplier is not None:
                 self.attack_multiplier = max(float(attack_multiplier), 0.01)
+            if combat_controls is not None:
+                self.combat_controls = normalize_controls(combat_controls, self.combat_controls)
             self._runtime_pending = True
 
     def _reset_battle_controls(self):
@@ -1075,7 +1100,7 @@ class GuardFishBot:
                 return
             self._natural_end_reason = str(reason)
             self._natural_end_requested = True
-        self._log("已请求本场正常结束：%s（基地降到 1 血，每次伤害改为随机 1–100，等待游戏结算）" % reason, "warn")
+        self._log("已请求本场正常结束：%s（基地降到 1 血，停止新攻击，等待游戏结算）" % reason, "warn")
 
     def request_pause(self):
         """GUI 只提交请求，当前场的收尾和暂停都在工作线程执行。"""
@@ -1182,7 +1207,7 @@ class GuardFishBot:
             pass
 
     def _install_runtime_script(self):
-        """只在用户开启功能或请求自然结束时动态装载引擎修改脚本。"""
+        """运行时加载轻量击杀监听；伤害、攻速等方法仅在相关开关开启时包装。"""
         if self._page is None:
             return False
         if self._runtime_script_loaded:
@@ -1190,10 +1215,12 @@ class GuardFishBot:
         try:
             self._page.evaluate(FAKE_DEVTOOLS_HOOK)
             self._page.evaluate(JS_HP_WATCH)
+            self._page.evaluate(JS_COMBAT_INSTALL)
+            self._runtime_epoch += 1
             self._runtime_script_loaded = True
             self._last_runtime_kills = 0
             self._runtime_applied = None
-            self._log("已动态加载回血/秒杀控制模块", "dim")
+            self._log("已加载战斗计数与实时控制模块", "dim")
             return True
         except Exception as e:
             self._log("动态加载回血/秒杀模块失败：%s" % str(e)[:120], "warn")
@@ -1202,6 +1229,7 @@ class GuardFishBot:
     def _unload_runtime_script(self):
         if self._page is None or not self._runtime_script_loaded:
             return
+        self._collect_kills()
         try:
             self._page.evaluate(JS_HP_UNLOAD)
         except Exception as e:
@@ -1221,6 +1249,7 @@ class GuardFishBot:
             one_hit_mode = normalize_one_hit_mode(self.one_hit_mode)
             one_hit_probability = max(0.0, min(float(self.one_hit_probability), 100.0))
             attack_multiplier = max(float(self.attack_multiplier), 0.01)
+            combat = self.combat_controls
             pending = bool(self._runtime_pending)
             natural_end = bool(self._natural_end_requested)
             natural_sent = bool(self._natural_end_sent)
@@ -1235,14 +1264,15 @@ class GuardFishBot:
                         "oneHitMode": one_hit_mode,
                         "oneHitProbability": one_hit_probability,
                         "attackMultiplier": attack_multiplier,
-                        "discover": True, "maxRefillMs": self.max_battle_seconds * 1000,
+                        "discover": True, "monitor": True, "monitorEpoch": self._runtime_epoch,
+                        "combat": default_controls(), "maxRefillMs": self.max_battle_seconds * 1000,
                     })
                     r = self._page.evaluate(JS_HP_END)
                     if isinstance(r, dict) and (r.get("ok") or r.get("pending")):
                         with self._control_lock:
                             self._natural_end_sent = True
                         if r.get("ok"):
-                            self._log("已将基地降到 1 血，关闭回血和伤害强化，每次伤害随机 1–100，等待自然结算", "warn")
+                            self._log("已将基地降到 1 血，暂停新攻击并关闭强化；在途伤害限制为 1–100，等待自然结算", "warn")
                         else:
                             self._log("已请求自然结束，等待识别战斗引擎", "warn")
                         return r
@@ -1253,39 +1283,35 @@ class GuardFishBot:
                 self._log("同步自然结束请求失败：%s" % str(e)[:120], "warn")
                 return None
 
-        active = hp_guard or one_hit
-        if active:
-            if not self._install_runtime_script():
-                return None
-            desired = (hp_guard, one_hit, threshold, one_hit_mode, one_hit_probability, attack_multiplier)
-            if pending or force or self._runtime_applied != desired:
-                try:
-                    r = self._page.evaluate(JS_HP_CFG, {
-                        "hpGuard": hp_guard, "oneHit": one_hit, "threshold": threshold,
-                        "oneHitMode": one_hit_mode,
-                        "oneHitProbability": one_hit_probability,
-                        "attackMultiplier": attack_multiplier,
-                        "discover": False, "maxRefillMs": self.max_battle_seconds * 1000,
-                    })
-                    with self._control_lock:
-                        self._runtime_pending = False
-                    self._runtime_applied = desired
-                    self._log("回血守护：%s（阈值 < %s 回满）｜秒杀模式：%s"
-                              % ("开" if r and r.get("hpGuard") else "关", threshold,
-                                 (one_hit_mode_text(one_hit_mode, one_hit_probability,
-                                                    attack_multiplier)
-                                  if r and r.get("oneHit") else "关")))
-                    return r
-                except Exception as e:
-                    self._log("同步回血/秒杀开关失败：%s" % str(e)[:120], "warn")
-                    return None
+        # 计数监听在整次挂机中保留；各个修改开关独立包装/恢复原生方法。
+        if not self._install_runtime_script():
             return None
-
-        # 两个功能都关闭时，动态卸载脚本并恢复被包装的方法。
-        if self._runtime_script_loaded:
-            self._unload_runtime_script()
-        with self._control_lock:
-            self._runtime_pending = False
+        desired = (hp_guard, one_hit, threshold, one_hit_mode, one_hit_probability,
+                   attack_multiplier, combat)
+        if pending or force or self._runtime_applied != desired:
+            try:
+                r = self._page.evaluate(JS_HP_CFG, {
+                    "hpGuard": hp_guard, "oneHit": one_hit, "threshold": threshold,
+                    "oneHitMode": one_hit_mode, "oneHitProbability": one_hit_probability,
+                    "attackMultiplier": attack_multiplier, "combat": combat,
+                    "monitor": True, "monitorEpoch": self._runtime_epoch,
+                    "discover": False, "maxRefillMs": self.max_battle_seconds * 1000,
+                })
+                with self._control_lock:
+                    self._runtime_pending = False
+                self._runtime_applied = desired
+                self._log("实时配置已同步：回血=%s｜伤害=%s｜攻速=%s｜分系覆盖=%s"
+                          % ("开" if hp_guard else "关",
+                             one_hit_mode_text(one_hit_mode, one_hit_probability, attack_multiplier) if one_hit else "关",
+                             ("固定 %.3g 秒" % combat["attack_speed"]["fixed"]
+                              if combat["attack_speed"]["mode"] == "fixed" else
+                              "倍率 %.3g" % combat["attack_speed"]["multiplier"])
+                             if combat["attack_speed"]["enabled"] else "关",
+                             "/".join(EFFECT_LABELS[k] for k, v in combat["effects"].items() if v["enabled"]) or "关"), "dim")
+                self._debug_write("runtime_config", combat=combat, hp_guard=hp_guard, one_hit=one_hit)
+                return r
+            except Exception as e:
+                self._log("同步战斗设置失败：%s" % str(e)[:120], "warn")
         return None
 
     def _apply_hp_config(self):
@@ -1353,6 +1379,24 @@ class GuardFishBot:
             self._debug_write("capture_error", error_type=type(exc).__name__)
 
     def _stage_record(self, record):
+        # 接口回调只排队；下一次读取引擎计数后再落盘，包含通关的最后一次击杀。
+        self._pending_stage_records.append(record)
+
+    def _collect_kills(self):
+        if self._page is not None and self._runtime_script_loaded:
+            try:
+                self._kills.consume(self._page.evaluate(JS_COMBAT_SNAPSHOT))
+            except Exception:
+                pass
+
+    def _flush_stage_records(self):
+        pending, self._pending_stage_records = self._pending_stage_records, []
+        for record in pending:
+            record.update(self._kills.for_stage(record["stage"]))
+            record["kills_partial"] |= bool(record["partial"])
+            self._write_stage_record(record)
+
+    def _write_stage_record(self, record):
         obj = {"date": self._date, "version": APP_VERSION,
                "round": self.status.get("round", 0), **record}
         try:
@@ -1367,22 +1411,27 @@ class GuardFishBot:
         self._debug_write("stage_timing", record=record)
         seconds = record["duration_s"]
         stage = record["stage"]
+        count = record.get("kills")
+        kills = "杀敌未采集" if count is None else "%s杀敌 %d" % (
+            "已观测" if record.get("kills_partial") else "本关", count)
         if record["outcome"] == "cleared":
             label = ("中途接管，仅计观测时段" if record["partial"] else
                      "stageEnd 未带关卡号，按当前关估算" if record["end_stage_inferred"] else
                      "关卡切换估算，可能含选技能等待" if record["estimated"] else
                      "stageStart → stageEnd 响应间隔")
-            self._log("第%s关通关耗时 %.1f 秒（%s）" % (stage, seconds, label))
+            self._log("第%s关通关耗时 %.1f 秒｜%s（%s）" % (stage, seconds, kills, label))
         elif record["outcome"] == "gap":
             self._log("第%s→%s关观测间隔 %.1f 秒（中间关卡数据缺失，不拆成单关耗时）"
                       % (stage, record["next_stage"], seconds), "warn")
         else:
-            self._log("第%s关已观测 %.1f 秒（本场结束时未确认通关）" % (stage, seconds), "dim")
+            self._log("第%s关已观测 %.1f 秒｜%s（本场结束时未确认通关）" % (stage, seconds, kills), "dim")
 
     def _finish_stage_timing(self, reason):
         if self._stage_timer is not None:
             timer, self._stage_timer = self._stage_timer, None
             timer.finish(time.monotonic(), time.time(), reason)
+            self._collect_kills()
+            self._flush_stage_records()
             return timer.records
         return []
 
@@ -1797,6 +1846,7 @@ class GuardFishBot:
             self._pause_requested = False
             self._paused = False
         self.rounds_done = 0
+        self._recovery_attempts = 0
         self.status["rounds_done"] = 0
         self._thread = threading.Thread(target=self._run, name="guardfish-bot", daemon=True)
         self._thread.start()
@@ -1828,7 +1878,10 @@ class GuardFishBot:
                 if r is None:
                     self._log("第%d场未能完成，停止。" % i, "error")
                     break
-                self.rounds_done += 1
+                completed = r.get("completed", True)
+                if completed:
+                    self.rounds_done += 1
+                    self._recovery_attempts = 0
                 self.status["rounds_done"] = self.rounds_done
                 self._battle_write({
                     "date": self._date, "round": i,
@@ -1839,6 +1892,7 @@ class GuardFishBot:
                     "result": r.get("resultText"), "skills": r.get("skills"),
                     "refills": r.get("refills"), "hpMin": r.get("hpMin"),
                     "oneHitKills": r.get("oneHitKills"),
+                    "kills": r.get("kills"), "completed": completed,
                     "ended": r.get("ended"),
                     "stageTimes": r.get("stageTimes", []),
                 })
@@ -1849,6 +1903,8 @@ class GuardFishBot:
                              ("结算：" + (r.get("resultText") or "")) if r.get("resultText") else ""))
                 if self._stop.is_set():
                     break
+                if not completed:
+                    self._log("本次中断未计入完成场数，继续第 %d 场任务。" % i, "warn")
                 if self.rounds <= 0 or i < self.rounds:
                     self._sleep_gap()
 
@@ -1922,6 +1978,8 @@ class GuardFishBot:
         self._stage_stop_announced = False
         self._one_hit_kills = 0
         self._last_runtime_kills = 0
+        self._kills = KillStats()
+        self._pending_stage_records = []
         with self._lock:
             self._battle_boxes = 0
         self._server_reject_ts = 0
@@ -1984,6 +2042,7 @@ class GuardFishBot:
         self._battle_active = True
         t_battle0 = time.time()
         ended = None
+        completed = True
         result_text = ""
         boxes = None
         last_hud = 0
@@ -1993,9 +2052,7 @@ class GuardFishBot:
         hp_min = None
         hp_refill_count = 0
         hp_found_logged = False
-        last_progress_ts = time.time()
-        last_sig = None
-        last_stall_warning = 0
+        activity_watch = ActivityWatch()
         end_started = None
         try:
             self._page.evaluate(JS_HP_DRAIN)      # 清掉上一场的残留事件
@@ -2088,24 +2145,29 @@ class GuardFishBot:
                         self._log("回血守护：本场已到 %s 分钟，停止回血让战斗自然结束（避免服务端超时判异常）"
                                   % ev.get("mins", 9))
 
-            # 慢关不代表结算：击杀和波次也算进展，无进展只提示，不刷新/计场。
-            sig = (stage.get("curStage"), stage.get("curHp"), hp_refill_count,
-                   self._one_hit_kills, (gf or {}).get("progress"),
-                   bool(st.get("skillPanel")), bool(st.get("result")), bool(st.get("treasure")),
-                   bool(st.get("hudClaimable")), bool(st.get("finalSkillList")))
-            if sig != last_sig:
-                last_sig = sig
-                last_progress_ts = time.time()
+            combat = (gf or {}).get("combat")
+            self._kills.consume(combat)
+            self._flush_stage_records()
+            self.status["kills"] = self._kills.total if self._kills.stages else None
+            suspended = (not st.get("inBattle") or self._natural_end_requested or any(
+                st.get(k) for k in ("skillPanel", "result", "treasure", "finalSkillList")))
+            stalled = activity_watch.observe(combat, time.monotonic(), suspended=suspended)
+            if activity_watch.progressed:
+                self._recovery_attempts = 0
             stuck_by_server = self._server_reject_ts and (time.time() - self._server_reject_ts > 15)
-            stuck_by_time = (time.time() - last_progress_ts) > 240
-            if st.get("inBattle") and not self._natural_end_requested \
-                    and not st.get("skillPanel") and not st.get("result") and not st.get("treasure") \
-                    and not st.get("finalSkillList"):
+            if not suspended:
                 if stuck_by_server:
                     self.request_natural_end("服务端拒绝对局请求，尝试正常收尾")
-                elif stuck_by_time and time.time() - last_stall_warning > 240:
-                    last_stall_warning = time.time()
-                    self._log("较长时间未观测到进展，继续监控；只有实际结算返回主界面才计场，单场时限仍生效。", "warn")
+                elif stalled:
+                    self._log("连续 4 分钟未发射弹丸或击杀敌人，刷新页面恢复任务；不将本次刷新计为完成。", "warn")
+                    recovered = self._recover_stalled_battle()
+                    activity_watch = ActivityWatch()
+                    if recovered == "lobby":
+                        ended, completed = "停滞中断", False
+                        break
+                    if recovered == "stop":
+                        return None
+                    continue
 
             # 记录 HUD 结构一次（供诊断）
             if st.get("inBattle") and not snap_done:
@@ -2125,10 +2187,11 @@ class GuardFishBot:
             self.status["hp"] = shown_hp
             if el - last_hud >= 60:
                 last_hud = el
-                self._log("进行中 t=%ss 第%s关 HP=%s 免费剩余=%s 回血=%d%s"
+                self._log("进行中 t=%ss 第%s关 HP=%s 免费剩余=%s 回血=%d%s｜杀敌=%s"
                           % (el, stage.get("curStage", "?"), shown_hp,
                              wm.get("freeNum", "?"), hp_refill_count,
-                             (" 秒杀=%d" % self._one_hit_kills) if self.one_hit else ""))
+                             (" 秒杀=%d" % self._one_hit_kills) if self.one_hit else "",
+                             self.status["kills"] if self.status["kills"] is not None else "未采集"))
 
             # 3.1 结算（顶部进度宝箱也可能使用 Result-module；必须确认战斗已结束）
             if st.get("result") or st.get("treasure"):
@@ -2177,7 +2240,14 @@ class GuardFishBot:
                     return None
                 # 在原战斗循环继续，不重置起始关/推进目标、技能、战报和累计计数。
                 end_started = time.time()
-                last_progress_ts = time.time()
+                activity_watch = ActivityWatch()
+                continue
+
+            if st.get("finalSkillList"):
+                result = self._click(JS_CLICK_FINAL_START)
+                if isinstance(result, dict) and result.get("ok"):
+                    self._log("技能确认列表 → 已点击开始战斗，继续当前场监控")
+                time.sleep(1.0)
                 continue
 
             # 3.2 关卡技能三选一
@@ -2243,12 +2313,45 @@ class GuardFishBot:
             "resultText": result_text,
             "skills": skills_chosen,
             "oneHitKills": self._one_hit_kills,
+            "kills": self._kills.total if self._kills.stages else None,
+            "completed": completed,
             "refills": hp_refill_count,
             "hpMin": hp_min,
             "hpTimeline": hp_timeline,
             "ended": ended,
             "stageTimes": stage_times,
         }
+
+    def _recover_stalled_battle(self):
+        """仅看门狗超时后使用；接回战斗保留当前场，回到大厅则记为中断重试。"""
+        self._recovery_attempts += 1
+        self._collect_kills()
+        self._flush_stage_records()
+        if self._recovery_attempts <= 3:
+            try:
+                self._snap("battle_inactive")
+                self._runtime_script_loaded = False
+                self._runtime_applied = None
+                self._page.reload(wait_until="domcontentloaded", timeout=60000)
+                self._wait_ready(60)
+                self._apply_runtime_controls(force=True)
+                st = self._state() or {}
+                if self._is_lobby(st):
+                    return "lobby"
+                if any(st.get(k) for k in ("inBattle", "skillPanel", "finalSkillList", "result", "treasure")):
+                    self._log("页面恢复，继续识别当前场；起始关与关卡目标保持不变。")
+                    return "battle"
+            except Exception as exc:
+                self._log("停滞恢复失败：%s" % str(exc)[:120], "warn")
+        if not self.pause_on_timeout:
+            return "stop"
+        self._log("自动恢复未能继续，暂停助手并保留当前任务，点击「恢复战斗」后重试。", "warn")
+        with self._control_lock:
+            self._pause_requested = True
+        if not self._wait_if_paused(unfinished=True):
+            return "stop"
+        self._recovery_attempts = 0
+        return "lobby" if self._is_lobby(self._state() or {}) else "battle"
 
     def _try_recover(self):
         """主页面卡住时的恢复：刷新页面（仅在非战斗中调用）"""
@@ -2379,6 +2482,21 @@ def main(default_debug=False):
                     help="概率秒杀触发概率（0~100，默认 50）")
     ap.add_argument("--attack-multiplier", type=float, default=2.0,
                     help="攻击倍率策略的伤害倍数（默认 2）")
+    speed_group = ap.add_mutually_exclusive_group()
+    speed_group.add_argument("--attack-speed-multiplier", type=float,
+                             help="独立攻速倍率；-2=原速的 1/2，0=原速")
+    speed_group.add_argument("--attack-interval", type=float,
+                             help="固定攻击间隔（游戏秒），自动限制到 0.2~180")
+    ap.add_argument("--repeat-ice", action="store_true", help="允许同一敌人本关重复冰冻")
+    ap.add_argument("--repeat-earth", action="store_true", help="允许同一敌人本关重复减速/眩晕")
+    for effect in EFFECTS:
+        chance_group = ap.add_mutually_exclusive_group()
+        chance_group.add_argument("--%s-probability" % effect, type=float,
+                                  help="%s固定概率（百分比）" % EFFECT_LABELS[effect])
+        chance_group.add_argument("--%s-probability-multiplier" % effect, type=float,
+                                  help="%s原生概率的倍率" % EFFECT_LABELS[effect])
+        ap.add_argument("--%s-cd" % effect, type=float,
+                        help="%s固定 CD（游戏秒），自动限制到允许范围" % EFFECT_LABELS[effect])
     ap.add_argument("--max-battle-minutes", type=float, default=MAX_BATTLE_SECONDS / 60,
                     help="单场最长监控时间（分钟，默认 13）")
     ap.add_argument("--stop-stage", type=int, default=0,
@@ -2386,6 +2504,22 @@ def main(default_debug=False):
     ap.add_argument("--advance-stages", type=int, default=0,
                     help="从本场起始关推进指定关卡数后自然结束（0=关闭）")
     args = ap.parse_args()
+    combat = default_controls()
+    for field, value in (("multiplier", args.attack_speed_multiplier), ("fixed", args.attack_interval)):
+        if value is not None:
+            combat["attack_speed"].update(enabled=True, mode="multiplier" if field == "multiplier" else "fixed")
+            combat["attack_speed"][field] = value
+    combat.update(repeat_ice=args.repeat_ice, repeat_earth=args.repeat_earth)
+    for effect in EFFECTS:
+        rule = combat["effects"][effect]
+        for suffix, field in (("probability", "probability"), ("probability_multiplier", "multiplier"), ("cd", "cd")):
+            value = getattr(args, effect + "_" + suffix)
+            if value is not None:
+                rule["enabled"] = True
+                rule[field] = value
+                if field != "cd":
+                    rule["mode"] = "fixed" if field == "probability" else "multiplier"
+    combat = normalize_controls(combat)
 
     if not 0 <= args.one_hit_probability <= 100:
         ap.error("--one-hit-probability 必须在 0~100 之间")
@@ -2419,7 +2553,8 @@ def main(default_debug=False):
                            advance_stages=args.advance_stages,
                            one_hit_mode=args.one_hit_mode,
                            one_hit_probability=args.one_hit_probability,
-                           attack_multiplier=args.attack_multiplier, debug=args.debug)
+                           attack_multiplier=args.attack_multiplier, debug=args.debug,
+                           combat_controls=combat)
         bot.add_log_sink(sink)
         start_desc = "命令行挂机启动：房间=%s 场数=%d" % (args.rid, args.rounds)
         if args.headless:

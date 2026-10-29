@@ -3,6 +3,8 @@ import json
 import math
 import os
 import tempfile
+from copy import deepcopy
+from combat_controls import default_controls, normalize_controls
 
 
 DEFAULTS = {
@@ -11,6 +13,7 @@ DEFAULTS = {
     "one_hit": False, "one_hit_mode": "full", "one_hit_probability": "50",
     "attack_multiplier": "2", "headless": False,
     "stop_stage": "0", "advance_stages": "0", "max_minutes": "13",
+    "combat": default_controls(),
 }
 LIMITS = {
     "rounds": (0, None, True), "gap_min": (0, None, False),
@@ -22,12 +25,14 @@ LIMITS = {
 
 
 def normalize(values, base=None):
-    result = dict(DEFAULTS if base is None else base)
+    result = deepcopy(DEFAULTS if base is None else base)
     if not isinstance(values, dict):
         return result
     for key, default in DEFAULTS.items():
         value = values.get(key)
-        if isinstance(default, bool):
+        if key == "combat":
+            result[key] = normalize_controls(value, result.get(key))
+        elif isinstance(default, bool):
             if isinstance(value, bool):
                 result[key] = value
         elif key in LIMITS:
@@ -59,9 +64,9 @@ def load(path):
             raise ValueError("配置根节点应为对象")
         return normalize(data.get("gui", data)), None
     except FileNotFoundError:
-        return dict(DEFAULTS), None
+        return deepcopy(DEFAULTS), None
     except (OSError, ValueError) as exc:
-        return dict(DEFAULTS), str(exc)
+        return deepcopy(DEFAULTS), str(exc)
 
 
 def save(path, values):

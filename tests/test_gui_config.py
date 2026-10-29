@@ -9,6 +9,57 @@ import settings
 
 
 class GuiConfigTests(unittest.TestCase):
+    def test_combat_settings_apply_live_clamp_and_survive_reopen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch('yu_gui.botmod.CONFIG_PATH', os.path.join(directory, 'config.json')), \
+                    patch('yu_gui.botmod.chrome_candidates', return_value=[]):
+                try:
+                    root = tk.Tk()
+                except tk.TclError as exc:
+                    self.skipTest('GUI requires a display: %s' % exc)
+                root.withdraw()
+                app = App(root)
+                app.bot, app.running = GuardFishBot(), True
+                w = app.combat_widgets
+                speed = w.groups['attack_speed']
+                wind = w.groups['wind']
+                speed['enabled'].set(True)
+                speed['value'].set('-2')
+                wind['enabled'].set(True)
+                wind['mode'].set('固定')
+                w._mode_changed('wind')
+                wind['value'].set('37.5')
+                wind['cd'].set('-1')
+                w.repeat_ice.set(True)
+                w.repeat_earth.set(True)
+                w.flush()
+                self.assertEqual(wind['cd'].get(), '0.5')
+                self.assertEqual(app.bot.combat_controls['attack_speed']['multiplier'], -2)
+                self.assertEqual(app.bot.combat_controls['effects']['wind']['probability'], 37.5)
+                self.assertTrue(app.bot.combat_controls['repeat_ice'])
+                wind['mode'].set('倍率')
+                w._mode_changed('wind')
+                wind['value'].set('1.5')
+                w.flush()
+                root.update_idletasks()
+                app.running = False
+                app.on_close()
+                root = tk.Tk()
+                root.withdraw()
+                app = App(root)
+                w = app.combat_widgets
+                try:
+                    self.assertEqual(w.groups['attack_speed']['value'].get(), '-2')
+                    self.assertEqual(w.groups['wind']['value'].get(), '1.5')
+                    self.assertEqual(w.groups['wind']['cd'].get(), '0.5')
+                    self.assertTrue(w.repeat_ice.get() and w.repeat_earth.get())
+                    w.groups['wind']['mode'].set('固定')
+                    w._mode_changed('wind')
+                    self.assertEqual(w.groups['wind']['value'].get(), '37.5')
+                finally:
+                    root.update_idletasks()
+                    app.on_close()
+
     def test_pause_button_changes_to_resume_and_keeps_bot(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch('yu_gui.botmod.CONFIG_PATH', os.path.join(directory, 'config.json')), \

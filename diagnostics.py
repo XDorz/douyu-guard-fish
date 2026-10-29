@@ -162,9 +162,11 @@ JS_ENGINE_SNAPSHOT = r"""
         const d = Object.getOwnPropertyDescriptor(p, key);
         if (!d || typeof d.value !== 'function') continue;
         if (full && interesting.test(key) && sourceChars < sourceLimit) {
-          const src = Function.prototype.toString.call(d.value);
+          const original = own(d.value, '__gfOriginal');
+          const src = Function.prototype.toString.call(typeof original === 'function' ? original : d.value);
           const limit = Math.min(12000, sourceLimit - sourceChars);
-          methods[key] = {source: src.slice(0, limit), truncated: src.length > limit};
+          methods[key] = {source: src.slice(0, limit), truncated: src.length > limit,
+                          wrapped: typeof original === 'function'};
           sourceChars += Math.min(src.length, limit);
         } else methods[key] = '[function]';
       }

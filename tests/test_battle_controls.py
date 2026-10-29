@@ -242,6 +242,51 @@ class BattleControlTests(unittest.TestCase):
         b._battle_write.assert_not_called()
         b._page.reload.assert_not_called()
 
+    def test_inactivity_recovery_does_not_count_aborted_battle(self):
+        clock = FakeClock()
+        b = self.battle_harness(clock, rounds=1, max_battle_seconds=1000)
+        reloaded = False
+
+        def state():
+            lobby = reloaded and b._page.reload.call_count == 1
+            if b._page.reload.call_count >= 2:
+                b.request_stop()
+            return {'inBattle': not lobby, 'canChallenge': lobby,
+                    'wm': {'stage': {'curStage': 121, 'curHp': 20}}}
+
+        def reload(**kwargs):
+            nonlocal reloaded
+            reloaded = True
+
+        def evaluate(js, *args):
+            if js == bot.JS_HP_DRAIN:
+                return {'combat': {'epoch': 1, 'totalKills': 0, 'stages': [], 'current': {
+                    'id': 1, 'projectiles': 0, 'tick': 0, 'running': True,
+                    'activityAvailable': True, 'cooling': False}}}
+            return None
+        b._page.evaluate.side_effect = evaluate
+        b._page.reload.side_effect = reload
+        b._wait_ready = Mock(return_value=True)
+        b._state = Mock(side_effect=state)
+        with patch('bot.time.time', clock.time), patch('bot.time.monotonic', clock.time), \
+                patch('bot.time.sleep', clock.sleep):
+            result = b._one_battle(1)
+        self.assertFalse(result['completed'])
+        self.assertEqual(result['ended'], '停滞中断')
+        b._page.reload.assert_called_once()
+        self.assertEqual(b.rounds_done, 0)
+
+    def test_run_retries_same_round_number_after_unconfirmed_recovery(self):
+        b = self.make_bot(rounds=2)
+        b._one_battle = Mock(side_effect=[{'completed': False, 'dur': 240},
+                                         {'completed': True, 'dur': 20},
+                                         {'completed': True, 'dur': 30}])
+        with patch('bot.ensure_dirs'):
+            b._run()
+        self.assertEqual([c.args[0] for c in b._one_battle.call_args_list], [1, 1, 2])
+        self.assertEqual(b.rounds_done, 2)
+        self.assertEqual([c.args[0]['completed'] for c in b._battle_write.call_args_list], [False, True, True])
+
 
 if __name__ == '__main__':
     unittest.main()
