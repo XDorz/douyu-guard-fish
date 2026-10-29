@@ -32,7 +32,7 @@ GAME_URL = "https://www.douyu.com/pages/vibe-lab-act202606-game/mine?rid={rid}&i
 HOME_URL = "https://www.douyu.com/"
 
 MAX_BATTLE_SECONDS = 13 * 60      # 单场最长等待（服务端上限 600s + 余量）
-END_GRACE_SECONDS = 45             # 请求自然结束后等待结算的宽限时间
+END_GRACE_SECONDS = 3 * 60         # 请求自然结束后等待结算的宽限时间（场上可能暂时没有接近基地的敌人）
 TICK = 0.5                         # 状态轮询间隔
 IDLE_STUCK_LIMIT = 90              # 空闲态卡住多久后尝试恢复（刷新页面）
 PRE_BATTLE_LIMIT = 90              # 点挑战后"无进展"超时（每有进展会重新计时）
@@ -305,7 +305,8 @@ JS_HP_WATCH = r"""
                             mgrRef: null, loopRef: null, wrapped: false, foundOnce: false,
                             fullHp: 0,
                             battleT0: 0, maxRefillMs: 540000, capped: false,
-                            oneHit: false, oneHitKills: 0, oneHitWrapped: false,
+                            oneHit: false, oneHitMode: 'full', oneHitProbability: 50,
+                            attackMultiplier: 2, oneHitKills: 0, oneHitWrapped: false,
                             discover: false, endRequested: false, endApplied: false,
                             intervalId: null, wrappedLoops: [],
                             scanCount: 0, scanInfo: null, diag: null, err: null, comp: ''};
@@ -501,9 +502,7 @@ JS_HP_WATCH = r"""
           }
         } catch (e) { GF.err = String(e); }
       }
-      // 秒杀：包装 _dealDamage，把本次伤害抬到「恰好等于敌人当前血量」。
-      // 原实现 actualDmg = min(max(1,floor(damage)), enemy.currentHp)，因此传 currentHp
-      // 必然打成 0 → 走原生的 _killEnemy（伤害统计/击杀回调/掉落/清关判定全部保留）。
+      // 秒杀策略：保留原 _dealDamage → _killEnemy → 掉落/清关链路，只调整传入伤害。
       if (GF.oneHit && !loop.__gfOneHitWrapped) {
         try {
           const proto2 = Object.getPrototypeOf(loop);
@@ -514,8 +513,22 @@ JS_HP_WATCH = r"""
             loop._dealDamage = function (enemy, damage, cardId, isCrit) {
               try {
                 if (GF.oneHit && enemy && typeof enemy.currentHp === 'number' && enemy.currentHp > 0) {
-                  GF.oneHitKills++;
-                  return orig2.call(this, enemy, enemy.currentHp, cardId, isCrit);
+                  const mode = GF.oneHitMode || 'full';
+                  let hit = mode === 'full';
+                  let nextDamage = damage;
+                  if (mode === 'probability') {
+                    hit = Math.random() < Math.max(0, Math.min(100, Number(GF.oneHitProbability) || 0)) / 100;
+                  } else if (mode === 'multiplier') {
+                    const mult = Math.max(0.01, Number(GF.attackMultiplier) || 1);
+                    nextDamage = Math.max(1, Math.floor((Number(damage) || 0) * mult));
+                    if (nextDamage >= enemy.currentHp) GF.oneHitKills++;
+                    return orig2.call(this, enemy, nextDamage, cardId, isCrit);
+                  }
+                  if (hit) {
+                    GF.oneHitKills++;
+                    if (mode === 'full' || mode === 'probability') nextDamage = enemy.currentHp;
+                    return orig2.call(this, enemy, nextDamage, cardId, isCrit);
+                  }
                 }
               } catch (e) { GF.err = String(e); }
               return orig2.call(this, enemy, damage, cardId, isCrit);
@@ -548,12 +561,23 @@ JS_HP_CFG = r"""
   if (cfg && cfg.hpGuard !== undefined) window.__GF.hpGuard = !!cfg.hpGuard;
   if (cfg && cfg.threshold !== undefined) window.__GF.threshold = Number(cfg.threshold) || 5;
   if (cfg && cfg.oneHit !== undefined) window.__GF.oneHit = !!cfg.oneHit;
+  if (cfg && cfg.oneHitMode !== undefined) {
+    const mode = String(cfg.oneHitMode || 'full');
+    window.__GF.oneHitMode = ['full', 'probability', 'multiplier'].indexOf(mode) >= 0 ? mode : 'full';
+  }
+  if (cfg && cfg.oneHitProbability !== undefined)
+    window.__GF.oneHitProbability = Math.max(0, Math.min(100, Number(cfg.oneHitProbability) || 0));
+  if (cfg && cfg.attackMultiplier !== undefined)
+    window.__GF.attackMultiplier = Math.max(0.01, Number(cfg.attackMultiplier) || 1);
   if (cfg && cfg.discover !== undefined) window.__GF.discover = !!cfg.discover;
   if (cfg && cfg.maxRefillMs !== undefined) window.__GF.maxRefillMs = Math.max(0, Number(cfg.maxRefillMs) || 0);
   // 守护循环（250ms）只要功能开启、正在寻找引擎或等待结束就运行
   window.__GF.enabled = !!(window.__GF.hpGuard || window.__GF.oneHit || window.__GF.discover || window.__GF.endRequested);
   return {hpGuard: window.__GF.hpGuard, enabled: window.__GF.enabled,
           threshold: window.__GF.threshold, oneHit: window.__GF.oneHit,
+          oneHitMode: window.__GF.oneHitMode,
+          oneHitProbability: window.__GF.oneHitProbability,
+          attackMultiplier: window.__GF.attackMultiplier,
           discover: !!window.__GF.discover, endRequested: !!window.__GF.endRequested};
 }
 """
@@ -587,7 +611,10 @@ JS_HP_DRAIN = r"""
   return {refills: gf.refills || 0, wrapped: !!gf.wrapped, found: !!gf.mgrRef,
           comp: gf.comp || '', hp: gf.hp,
           hpGuard: !!gf.hpGuard, enabled: !!gf.enabled, discover: !!gf.discover,
-          oneHit: !!gf.oneHit, oneHitWrapped: !!gf.oneHitWrapped,
+          oneHit: !!gf.oneHit, oneHitMode: gf.oneHitMode || 'full',
+          oneHitProbability: Number(gf.oneHitProbability) || 0,
+          attackMultiplier: Number(gf.attackMultiplier) || 1,
+          oneHitWrapped: !!gf.oneHitWrapped,
           oneHitKills: gf.oneHitKills || 0,
           endRequested: !!gf.endRequested, endApplied: !!gf.endApplied,
           scanInfo: gf.scanInfo, err: gf.err, events: ev};
@@ -899,13 +926,31 @@ def score_skill_text(txt):
     return 300
 
 
+ONE_HIT_MODES = {"full", "probability", "multiplier"}
+
+
+def normalize_one_hit_mode(mode):
+    mode = str(mode or "full").strip().lower()
+    return mode if mode in ONE_HIT_MODES else "full"
+
+
+def one_hit_mode_text(mode, probability=50.0, multiplier=2.0):
+    mode = normalize_one_hit_mode(mode)
+    if mode == "probability":
+        return "概率 %.1f%%" % float(probability)
+    if mode == "multiplier":
+        return "攻击 %.2fx" % float(multiplier)
+    return "全额"
+
+
 # ---------------------------------------------------------------- Bot
 class GuardFishBot:
     def __init__(self, rid=DEFAULT_RID, rounds=10, gap_min=5, gap_max=15,
                  headless=False, claim_weekpass=True, on_log=None,
                  hp_guard=True, hp_threshold=5, coin_play=True, one_hit=False,
                  max_battle_seconds=MAX_BATTLE_SECONDS, stop_stage=0,
-                 advance_stages=0):
+                 advance_stages=0, one_hit_mode="full",
+                 one_hit_probability=50.0, attack_multiplier=2.0):
         self.rid = str(rid)
         self.rounds = int(rounds)
         self.gap_min = float(gap_min or 0)
@@ -916,6 +961,9 @@ class GuardFishBot:
         self.hp_threshold = int(hp_threshold or 5)
         self.coin_play = bool(coin_play)          # 免费用尽后用银币续打（银币为免费获取）
         self.one_hit = bool(one_hit)              # 秒杀模式：我方卡牌造成的伤害直接击杀
+        self.one_hit_mode = normalize_one_hit_mode(one_hit_mode)
+        self.one_hit_probability = max(0.0, min(float(one_hit_probability or 0), 100.0))
+        self.attack_multiplier = max(float(attack_multiplier or 1.0), 0.01)
         self.max_battle_seconds = max(float(max_battle_seconds or MAX_BATTLE_SECONDS), 1.0)
         self.stop_stage = max(int(stop_stage or 0), 0)       # 绝对关卡目标，0=关闭
         self.advance_stages = max(int(advance_stages or 0), 0)  # 从起始关推进的关卡数，0=关闭
@@ -960,7 +1008,9 @@ class GuardFishBot:
     def add_log_sink(self, fn):
         self._sinks.append(fn)
 
-    def set_runtime_controls(self, hp_guard=None, one_hit=None, hp_threshold=None):
+    def set_runtime_controls(self, hp_guard=None, one_hit=None, hp_threshold=None,
+                             one_hit_mode=None, one_hit_probability=None,
+                             attack_multiplier=None):
         """更新运行中的回血/秒杀开关；实际页面操作由机器人线程执行。"""
         with self._control_lock:
             if hp_guard is not None:
@@ -969,6 +1019,12 @@ class GuardFishBot:
                 self.one_hit = bool(one_hit)
             if hp_threshold is not None:
                 self.hp_threshold = max(int(hp_threshold), 1)
+            if one_hit_mode is not None:
+                self.one_hit_mode = normalize_one_hit_mode(one_hit_mode)
+            if one_hit_probability is not None:
+                self.one_hit_probability = max(0.0, min(float(one_hit_probability), 100.0))
+            if attack_multiplier is not None:
+                self.attack_multiplier = max(float(attack_multiplier), 0.01)
             self._runtime_pending = True
 
     def _reset_battle_controls(self):
@@ -1076,6 +1132,9 @@ class GuardFishBot:
             hp_guard = bool(self.hp_guard)
             one_hit = bool(self.one_hit)
             threshold = max(int(self.hp_threshold or 5), 1)
+            one_hit_mode = normalize_one_hit_mode(self.one_hit_mode)
+            one_hit_probability = max(0.0, min(float(self.one_hit_probability), 100.0))
+            attack_multiplier = max(float(self.attack_multiplier), 0.01)
             pending = bool(self._runtime_pending)
             natural_end = bool(self._natural_end_requested)
             natural_sent = bool(self._natural_end_sent)
@@ -1087,6 +1146,9 @@ class GuardFishBot:
                 if not natural_sent:
                     self._page.evaluate(JS_HP_CFG, {
                         "hpGuard": False, "oneHit": False, "threshold": threshold,
+                        "oneHitMode": one_hit_mode,
+                        "oneHitProbability": one_hit_probability,
+                        "attackMultiplier": attack_multiplier,
                         "discover": True, "maxRefillMs": self.max_battle_seconds * 1000,
                     })
                     r = self._page.evaluate(JS_HP_END)
@@ -1113,14 +1175,20 @@ class GuardFishBot:
                 try:
                     r = self._page.evaluate(JS_HP_CFG, {
                         "hpGuard": hp_guard, "oneHit": one_hit, "threshold": threshold,
+                        "oneHitMode": one_hit_mode,
+                        "oneHitProbability": one_hit_probability,
+                        "attackMultiplier": attack_multiplier,
                         "discover": False, "maxRefillMs": self.max_battle_seconds * 1000,
                     })
                     with self._control_lock:
                         self._runtime_pending = False
-                    self._runtime_applied = (hp_guard, one_hit, threshold)
+                    self._runtime_applied = (hp_guard, one_hit, threshold, one_hit_mode,
+                                             one_hit_probability, attack_multiplier)
                     self._log("回血守护：%s（阈值 < %s 回满）｜秒杀模式：%s"
                               % ("开" if r and r.get("hpGuard") else "关", threshold,
-                                 "开" if r and r.get("oneHit") else "关"))
+                                 (one_hit_mode_text(one_hit_mode, one_hit_probability,
+                                                    attack_multiplier)
+                                  if r and r.get("oneHit") else "关")))
                     return r
                 except Exception as e:
                     self._log("同步回血/秒杀开关失败：%s" % str(e)[:120], "warn")
@@ -1771,7 +1839,10 @@ class GuardFishBot:
                     hp_found_logged = True
                     modes = "回血守护：%s｜秒杀模式：%s" % (
                         "开" if gf.get("hpGuard") else "关",
-                        "开" if gf.get("oneHit") else "关")
+                        (one_hit_mode_text(gf.get("oneHitMode"),
+                                           gf.get("oneHitProbability", 50),
+                                           gf.get("attackMultiplier", 2))
+                         if gf.get("oneHit") else "关"))
                     self._log("战斗引擎已识别（%s）｜%s" %
                               (gf.get("comp") or "engine", modes),
                               "dim" if not gf.get("hpGuard") else "info")
@@ -2070,6 +2141,12 @@ def main():
     ap.add_argument("--hp-threshold", type=int, default=5, help="回血阈值（血量低于该值回满，默认 5）")
     ap.add_argument("--no-coin", action="store_true", help="免费用尽后不用银币续打（默认会用，银币为免费获取）")
     ap.add_argument("--one-hit", action="store_true", help="秒杀模式：我方卡牌伤害直接击杀怪物")
+    ap.add_argument("--one-hit-mode", choices=("full", "probability", "multiplier"), default="full",
+                    help="秒杀策略：full=全额，probability=概率，multiplier=攻击倍率")
+    ap.add_argument("--one-hit-probability", type=float, default=50.0,
+                    help="概率秒杀触发概率（0~100，默认 50）")
+    ap.add_argument("--attack-multiplier", type=float, default=2.0,
+                    help="攻击倍率策略的伤害倍数（默认 2）")
     ap.add_argument("--max-battle-minutes", type=float, default=MAX_BATTLE_SECONDS / 60,
                     help="单场最长监控时间（分钟，默认 13）")
     ap.add_argument("--stop-stage", type=int, default=0,
@@ -2077,6 +2154,11 @@ def main():
     ap.add_argument("--advance-stages", type=int, default=0,
                     help="从本场起始关推进指定关卡数后自然结束（0=关闭）")
     args = ap.parse_args()
+
+    if not 0 <= args.one_hit_probability <= 100:
+        ap.error("--one-hit-probability 必须在 0~100 之间")
+    if args.attack_multiplier <= 0:
+        ap.error("--attack-multiplier 必须大于 0")
 
     if args.selftest:
         selftest()
@@ -2102,11 +2184,18 @@ def main():
                            coin_play=not args.no_coin, one_hit=args.one_hit,
                            max_battle_seconds=args.max_battle_minutes * 60,
                            stop_stage=args.stop_stage,
-                           advance_stages=args.advance_stages)
+                           advance_stages=args.advance_stages,
+                           one_hit_mode=args.one_hit_mode,
+                           one_hit_probability=args.one_hit_probability,
+                           attack_multiplier=args.attack_multiplier)
         bot.add_log_sink(sink)
-        bot._log("命令行挂机启动：房间=%s 场数=%d%s%s" % (args.rid, args.rounds,
-                 " [headless]" if args.headless else "",
-                 " [秒杀模式]" if args.one_hit else ""))
+        start_desc = "命令行挂机启动：房间=%s 场数=%d" % (args.rid, args.rounds)
+        if args.headless:
+            start_desc += " [headless]"
+        if args.one_hit:
+            start_desc += " [秒杀模式=%s]" % one_hit_mode_text(
+                args.one_hit_mode, args.one_hit_probability, args.attack_multiplier)
+        bot._log(start_desc)
         bot.start()
         try:
             while bot._thread and bot._thread.is_alive():
@@ -2122,6 +2211,9 @@ def main():
     print("  --login          打开浏览器登录斗鱼（首次/掉登录后）")
     print("  --run            命令行挂机（--rounds N --rid 12306 --headless）")
     print("  --one-hit        秒杀模式：我方卡牌伤害直接击杀怪物")
+    print("  --one-hit-mode full|probability|multiplier  秒杀策略")
+    print("  --one-hit-probability N  概率秒杀触发概率（0~100）")
+    print("  --attack-multiplier N  攻击倍率策略的伤害倍数")
     print("  --no-hp          关闭血量低于阈值自动回满")
     print("  --no-coin        免费用尽后不用银币续打")
     print("  --max-battle-minutes N  单场最长监控时间（分钟）")
