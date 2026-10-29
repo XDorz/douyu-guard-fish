@@ -3,14 +3,17 @@
 import os
 import playwright
 
+IS_DEBUG_BUILD = os.environ.get("GUARD_FISH_BUILD_FLAVOR") == "debug"
+ENTRY = "yu_debug.py" if IS_DEBUG_BUILD else "yu_gui.py"
+EXE_NAME = "保卫鱼娘助手-Debug" if IS_DEBUG_BUILD else "保卫鱼娘助手"
 PW_DIR = os.path.dirname(playwright.__file__)
 DRIVER = os.path.join(PW_DIR, "driver")          # node.exe + package/cli.js（约 100MB）
 
-datas = [(DRIVER, os.path.join("playwright", "driver"))]
+datas = [(DRIVER, os.path.join("playwright", "driver")), ("VERSION", ".")]
 hiddenimports = ["playwright", "playwright.sync_api", "playwright.async_api", "greenlet"]
 
 a = Analysis(
-    ["yu_gui.py"],
+    [ENTRY],
     pathex=["."],
     binaries=[],
     datas=datas,
@@ -29,7 +32,7 @@ exe = EXE(
     a.scripts,
     a.binaries,
     a.datas,
-    name="保卫鱼娘助手",
+    name=EXE_NAME,
     debug=False,
     strip=False,
     upx=False,

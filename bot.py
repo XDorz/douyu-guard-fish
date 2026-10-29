@@ -25,8 +25,15 @@ import tempfile
 import threading
 import traceback
 import datetime
+from stage_timing import StageTimer, api_stage
+from diagnostics import DebugRecorder, JS_ENGINE_SNAPSHOT, safe_api_data
 
 APP_NAME = "保卫鱼娘挂机助手"
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"), encoding="utf-8") as _vf:
+        APP_VERSION = _vf.read().strip()
+except OSError:
+    APP_VERSION = "dev"
 DEFAULT_RID = "12306"
 GAME_URL = "https://www.douyu.com/pages/vibe-lab-act202606-game/mine?rid={rid}&isAnchorSide=0"
 HOME_URL = "https://www.douyu.com/"
@@ -74,6 +81,7 @@ else:
 
 PROFILE = os.path.join(DATA_DIR, "chrome_profile")
 LOGDIR = os.path.join(DATA_DIR, "logs")
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 
 
 def ensure_dirs():
@@ -950,7 +958,7 @@ class GuardFishBot:
                  hp_guard=True, hp_threshold=5, coin_play=True, one_hit=False,
                  max_battle_seconds=MAX_BATTLE_SECONDS, stop_stage=0,
                  advance_stages=0, one_hit_mode="full",
-                 one_hit_probability=50.0, attack_multiplier=2.0):
+                 one_hit_probability=50.0, attack_multiplier=2.0, debug=False):
         self.rid = str(rid)
         self.rounds = int(rounds)
         self.gap_min = float(gap_min or 0)
@@ -967,6 +975,15 @@ class GuardFishBot:
         self.max_battle_seconds = max(float(max_battle_seconds or MAX_BATTLE_SECONDS), 1.0)
         self.stop_stage = max(int(stop_stage or 0), 0)       # 绝对关卡目标，0=关闭
         self.advance_stages = max(int(advance_stages or 0), 0)  # 从起始关推进的关卡数，0=关闭
+        self.debug = bool(debug)
+        self._debug_recorder = None
+        self._debug_failed = False
+        self._debug_last_capture = None
+        self._debug_last_stage = None
+        self._debug_sources_collected = False
+        self._debug_poll_stage = None
+        self._stage_timer = None
+        self._stage_fp = None
         self._one_hit_kills = 0
         self._battle_paid = "free"                # free / coin
 
@@ -1232,6 +1249,74 @@ class GuardFishBot:
             pass
         self._pw = None
 
+    # -------- 诊断与单关统计（不参与游戏控制） --------
+    def _debug_write(self, kind, **data):
+        if not self.debug or self._debug_failed:
+            return
+        try:
+            if self._debug_recorder is None:
+                self._debug_recorder = DebugRecorder(LOGDIR, APP_VERSION)
+                self._log("Debug 诊断文件：%s" % self._debug_recorder.path)
+            self._debug_recorder.write(kind, round=self.status.get("round", 0), **data)
+        except Exception as exc:
+            self._debug_failed = True
+            self._log("Debug 写入失败，继续挂机：%s" % str(exc)[:120], "warn")
+
+    def _debug_capture(self, st, force=False):
+        if not self.debug or self._debug_failed or self._page is None:
+            return
+        now = time.monotonic()
+        stage = ((st.get("wm") or {}).get("stage") or {}).get("curStage")
+        if (not force and self._debug_last_capture is not None
+                and now - self._debug_last_capture < 15 and stage == self._debug_last_stage):
+            return
+        self._debug_last_capture = now
+        self._debug_last_stage = stage
+        try:
+            snapshot = self._page.evaluate(JS_ENGINE_SNAPSHOT, {"sources": not self._debug_sources_collected})
+            if isinstance(snapshot, dict) and snapshot.get("found"):
+                self._debug_sources_collected = True
+            self._debug_write("engine_snapshot", monotonic_s=now, stage=stage,
+                              state={k: bool(st.get(k)) for k in ("inBattle", "result", "treasure", "skillPanel", "canChallenge")},
+                              snapshot=snapshot)
+        except Exception as exc:
+            # 不导出浏览器报错的 URL/堆栈，以免混入个人页面数据。
+            self._debug_write("capture_error", error_type=type(exc).__name__)
+
+    def _stage_record(self, record):
+        obj = {"date": self._date, "version": APP_VERSION,
+               "round": self.status.get("round", 0), **record}
+        try:
+            if self._stage_fp is None:
+                path = os.path.join(LOGDIR, "stages_%s.jsonl" % self._date)
+                self._stage_fp = open(path, "a", encoding="utf-8")
+                self._log("单关耗时写入：%s" % path, "dim")
+            self._stage_fp.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            self._stage_fp.flush()
+        except OSError as exc:
+            self._log("单关耗时写入失败：%s" % str(exc)[:100], "warn")
+        self._debug_write("stage_timing", record=record)
+        seconds = record["duration_s"]
+        stage = record["stage"]
+        if record["outcome"] == "cleared":
+            label = ("中途接管，仅计观测时段" if record["partial"] else
+                     "stageEnd 未带关卡号，按当前关估算" if record["end_stage_inferred"] else
+                     "关卡切换估算，可能含选技能等待" if record["estimated"] else
+                     "stageStart → stageEnd 响应间隔")
+            self._log("第%s关通关耗时 %.1f 秒（%s）" % (stage, seconds, label))
+        elif record["outcome"] == "gap":
+            self._log("第%s→%s关观测间隔 %.1f 秒（中间关卡数据缺失，不拆成单关耗时）"
+                      % (stage, record["next_stage"], seconds), "warn")
+        else:
+            self._log("第%s关已观测 %.1f 秒（本场结束时未确认通关）" % (stage, seconds), "dim")
+
+    def _finish_stage_timing(self, reason):
+        if self._stage_timer is not None:
+            timer, self._stage_timer = self._stage_timer, None
+            timer.finish(time.monotonic(), time.time(), reason)
+            return timer.records
+        return []
+
     # -------- 抓包 --------
     def _on_response(self, resp):
         try:
@@ -1239,6 +1324,7 @@ class GuardFishBot:
             if "/japi/revenuenc/" not in url or "/actgame/" not in url:
                 return
             api = url.split("/actgame/")[-1].split("?")[0]
+            received_mono, received_wall = time.monotonic(), time.time()
             try:
                 body = resp.text()
             except Exception:
@@ -1246,6 +1332,12 @@ class GuardFishBot:
             if body:
                 try:
                     j = json.loads(body)
+                    if self._stage_timer is not None and 200 <= resp.status < 300:
+                        self._stage_timer.on_api(api, j, received_mono, received_wall)
+                    if self.debug and api != "game/stageEventReport":
+                        self._debug_write("api_response", api=api, status=resp.status,
+                                          monotonic_s=received_mono, stage=api_stage(j),
+                                          data=safe_api_data(j))
                     # 战斗统计：宝箱领取累计
                     if api == "game/receiveBox" and isinstance(j, dict):
                         d = j.get("data") or {}
@@ -1310,7 +1402,14 @@ class GuardFishBot:
     # -------- 页面动作 --------
     def _state(self):
         try:
-            return self._page.evaluate(JS_STATE)
+            st = self._page.evaluate(JS_STATE)
+            if self._stage_timer is not None and st and st.get("inBattle"):
+                stage = ((st.get("wm") or {}).get("stage") or {}).get("curStage")
+                self._stage_timer.observe(stage, time.monotonic(), time.time())
+                if stage != self._debug_poll_stage:
+                    self._debug_poll_stage = stage
+                    self._debug_write("poll_stage_change", stage=stage, monotonic_s=time.monotonic())
+            return st
         except Exception as e:
             self._log("状态读取失败：%s" % str(e)[:120], "warn")
             return None
@@ -1616,6 +1715,11 @@ class GuardFishBot:
 
     def _run(self):
         ensure_dirs()
+        self._debug_write("run_start", hp_guard=self.hp_guard, one_hit=self.one_hit,
+                          one_hit_mode=self.one_hit_mode, one_hit_probability=self.one_hit_probability,
+                          attack_multiplier=self.attack_multiplier, rounds=self.rounds,
+                          stop_stage=self.stop_stage, advance_stages=self.advance_stages,
+                          max_battle_seconds=self.max_battle_seconds)
         try:
             self._ensure_browser()
             if not self._goto_game():
@@ -1648,6 +1752,7 @@ class GuardFishBot:
                     "refills": r.get("refills"), "hpMin": r.get("hpMin"),
                     "oneHitKills": r.get("oneHitKills"),
                     "ended": r.get("ended"),
+                    "stageTimes": r.get("stageTimes", []),
                 })
                 self._log("战报：起始第%s关 → 到达第%s关，用时 %.0f 秒，回血 %s 次，%s%s"
                           % (r.get("stage0"), r.get("stageN"), r.get("dur") or 0,
@@ -1668,6 +1773,8 @@ class GuardFishBot:
             self._log(traceback.format_exc()[-800:], "error")
             self.status["state"] = "异常"
         finally:
+            self._finish_stage_timing("运行终止")
+            self._debug_write("run_end", state=self.status.get("state"))
             self._battle_active = False
             try:
                 self._close_browser()
@@ -1677,6 +1784,14 @@ class GuardFishBot:
                 self._shutdown_pw()
             except Exception:
                 pass
+            for attr in ("_api_fp", "_battle_fp", "_stage_fp", "_debug_recorder"):
+                writer = getattr(self, attr)
+                if writer is not None:
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
+                    setattr(self, attr, None)
 
     def _sleep_gap(self):
         lo, hi = min(self.gap_min, self.gap_max), max(self.gap_min, self.gap_max)
@@ -1703,6 +1818,11 @@ class GuardFishBot:
         """打一场，返回统计 dict 或 None"""
         # 自然结束只属于上一场；若不清理，下一场会刚进入战斗就再次被降到 1 血。
         self._reset_battle_controls()
+        self._battle_active = False
+        self._debug_last_capture = None
+        self._debug_last_stage = None
+        self._debug_poll_stage = None
+        self._debug_sources_collected = False
         self.status["state"] = "准备开局"
         self._stage_target = None
         self._stage_stop_announced = False
@@ -1741,6 +1861,7 @@ class GuardFishBot:
 
         # 1+2) 开局（含数据就绪等待、点击重试；失败自动恢复后重试一次）
         stage0 = None
+        self._stage_timer = StageTimer(self._stage_record)
         started, info = self._try_start_battle()
         skills_chosen = list(info.get("skills") or [])
         if not started:
@@ -1809,6 +1930,7 @@ class GuardFishBot:
             if not st:
                 continue
             self._sync_status(st)
+            self._debug_capture(st)
             wm = st.get("wm") or {}
             stage = (wm.get("stage") or {})
             if stage0 is None and stage.get("curStage"):
@@ -1971,6 +2093,10 @@ class GuardFishBot:
                     break
 
         dur = time.time() - t_battle0
+        self._battle_active = False
+        stage_times = self._finish_stage_timing(ended or "监控结束")
+        self._debug_capture(self._state() or {}, force=True)
+        self._debug_write("battle_end", ended=ended, duration_s=dur)
         if ended is None:
             ended = "超时未结算"
             self._log("单场监控结束但未检测到结算，停止继续开新场。", "error")
@@ -2018,6 +2144,7 @@ class GuardFishBot:
             "hpMin": hp_min,
             "hpTimeline": hp_timeline,
             "ended": ended,
+            "stageTimes": stage_times,
         }
 
     def _try_recover(self):
@@ -2125,12 +2252,14 @@ def selftest():
 
 
 # ---------------------------------------------------------------- CLI
-def main():
+def main(default_debug=False):
     import argparse
     ap = argparse.ArgumentParser(description=APP_NAME)
     ap.add_argument("--run", action="store_true", help="命令行挂机")
     ap.add_argument("--login", action="store_true", help="打开浏览器登录斗鱼")
     ap.add_argument("--selftest", action="store_true", help="自检（driver/浏览器）")
+    ap.add_argument("--debug", action="store_true", default=default_debug,
+                    help="生成 logs/debug_*.jsonl 引擎与关卡诊断文件")
     ap.add_argument("--rid", default=DEFAULT_RID, help="房间号（默认 %s）" % DEFAULT_RID)
     ap.add_argument("--rounds", type=int, default=10, help="场数（0=不限，打完免费次数后银币够就继续）")
     ap.add_argument("--gap-min", type=float, default=5, help="场间最小间隔秒")
@@ -2187,7 +2316,7 @@ def main():
                            advance_stages=args.advance_stages,
                            one_hit_mode=args.one_hit_mode,
                            one_hit_probability=args.one_hit_probability,
-                           attack_multiplier=args.attack_multiplier)
+                           attack_multiplier=args.attack_multiplier, debug=args.debug)
         bot.add_log_sink(sink)
         start_desc = "命令行挂机启动：房间=%s 场数=%d" % (args.rid, args.rounds)
         if args.headless:

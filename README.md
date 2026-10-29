@@ -15,12 +15,14 @@
 - **结束条件**：可设置打到指定绝对关卡、从本场起始关推进指定关卡数、单场最长监控时间。两个关卡目标同时设置时取较大的实际关卡数；达到目标只结束当前场，成功结算后仍按「场数」继续。
 - **自然结束宽限**：单场时限到点后先关闭回血/秒杀并把基地降到 1 血，最多等待 3 分钟让场上敌人完成原生结算；仍未结算才停止继续开新场。
 - **数据抓包**：所有游戏接口响应落盘 `logs/api_*.jsonl`；每场战报 `logs/battles_*.jsonl`（起始关/结束关/用时/技能选择/回血次数/秒杀次数/血量时间线）
+- **单关耗时**：通过关卡后单独输出用时，保存在 `logs/stages_*.jsonl`，同时写入战报的 `stageTimes`。
+- **配置保存**：GUI 设置自动保存在数据目录的 `config.json`，普通版和 Debug 版共用，替换 EXE 后自动恢复。
 - **安全红线**：**绝技、加速、技能刷新等一切需要鱼翅（付费）的功能一律不自动点击**；免费用尽后仅使用免费获取的**银币**续打（10 银币/局，余额不足自动停止）
 
 ## 快速开始（免安装）
 
-1. 到 [Releases](../../releases) 下载 `guard-fish-assistant-v*-win64.zip`，解压
-2. 运行 `保卫鱼娘助手.exe`
+1. 到 [最新 Release](https://github.com/XDorz/douyu-guard-fish/releases/latest) 直接下载 `guard-fish-assistant-v版本号-win64.exe`，无需解压
+2. 运行下载的 EXE（需要诊断时选择带 `-debug-` 的 EXE）
 3. 首次使用点「登录斗鱼」登录账号（登录态保存在本机 `chrome_profile/`，有效期约 7 天）
 4. 填房间号（默认 `12306`）→ 点「开始挂机」
 
@@ -40,6 +42,7 @@
 保卫鱼娘助手.exe --run --stop-stage 20      # 到第 20 关后自然结束
 保卫鱼娘助手.exe --run --advance-stages 5   # 从起始关再推进 5 关后自然结束
 保卫鱼娘助手.exe --selftest                 # 自检（driver / 浏览器可用性）
+保卫鱼娘助手.exe --run --debug              # CLI 挂机并生成诊断文件
 ```
 
 > **关于 CPU 占用**：游戏是 WebGL（PixiJS）画面，程序默认启用硬件加速，战斗中约占 **3~5% 整机 CPU**。
@@ -66,9 +69,14 @@ python bot.py --run --rounds 1   # 命令行
 
 产物：`保卫鱼娘自动挂机\保卫鱼娘助手.exe`。需要完整版 Python（自带 tkinter）。
 
-仓库中的 `.github/workflows/build-windows.yml` 可在 GitHub Actions 的 `workflow_dispatch`
-手动触发，也会在推送 `v*` 标签时自动构建。构建结果以 Windows ZIP artifact 提供；GitHub runner
-只负责编译，不需要安装 Chrome，运行时仍使用用户电脑上的 Chrome/Edge。
+仓库中的 `.github/workflows/build-windows.yml` 可手动触发，也会在推送 `v*` 标签时自动构建。
+工作流验证代码、分别构建普通版/Debug 版，然后把两个 EXE 直接上传到 GitHub Release。
+版本来自 `VERSION`，使用 `v1.1.0`、`v1.1.1` 这样的普通 Tag；发布新提交前更新 `VERSION`
+及 `RELEASE_NOTES.md`，已有版本的 Tag 不移动。Actions 备份产物也只打包一层。
+GitHub runner 无需安装 Chrome，运行时仍使用用户电脑上的 Chrome/Edge。
+
+本地打包 Debug 版：在运行打包命令前设置 `GUARD_FISH_BUILD_FLAVOR=debug`，产物为
+`保卫鱼娘助手-Debug.exe`。从源码启动可运行 `python yu_debug.py` 或 `python yu_gui.py --debug`。
 
 Playwright 官方没有 PyInstaller hook，`yu_gui.spec` 里手动把 `site-packages/playwright/driver`（node.exe + cli.js，约 102MB）打进了包。
 
@@ -77,6 +85,10 @@ Playwright 官方没有 PyInstaller hook，`yu_gui.spec` 里手动把 `site-pack
 ```
 bot.py                    核心：Playwright 驱动 + 页面状态机 + 自动决策
 yu_gui.py                 桌面 GUI + CLI 入口
+yu_debug.py               Debug GUI 入口
+diagnostics.py            只读引擎采集与诊断文件
+stage_timing.py           单关计时观察器
+settings.py               GUI 配置读写
 yu_gui.spec               PyInstaller 打包配置
 打包exe.bat               一键打包
 启动桌面助手.bat           优先跑 exe，否则跑源码
@@ -94,8 +106,28 @@ probe/                    开发期探测脚本（探明机制过程，可忽略
 
 ## 数据目录
 
-默认存在 exe 同级：`chrome_profile/`（登录态）、`logs/`（抓包 + 战报 + 异常截图）。  
+默认存在 exe 同级：`config.json`（GUI 配置）、`chrome_profile/`（登录态）、`logs/`（抓包 + 战报 + 异常截图）。
 exe 所在目录不可写（如装在 `Program Files`）时自动回退到 `%LOCALAPPDATA%\GuardFishBot`。
+
+更新时把新版 EXE 放入原数据目录，保留 `config.json` 与 `chrome_profile/`；如果换目录，需将它们一同复制。
+此前版本没有写过配置文件，因此首次升级到 v1.1.0 仍需填一次设置，之后会自动保存。
+GUI 配置不覆盖 CLI 显式参数。
+
+## 单关耗时与 Debug 反馈
+
+`进行中 t=...` 是约每 60 秒输出的状态日志，`t` 为本场监控时间；关卡号来自接口**响应**更新的
+`window.__WM.stage`，由助手轮询读取。常规轮询间隔仍为 0.5 秒，处理技能或弹窗时会有短暂等待。
+
+单关计时优先记录 `stageStart` 和 `stageEnd` 的响应观测时间，看到进入下一关后才确认前一关通过。
+接口齐全时，选技能等关间等待不计入这对响应的间隔。缺少接口时标注切关估算；中途接管标注
+仅观测到的时段；跨过多关、最后未完成的关卡不会伪造单关通关成绩。数值是客户端观测耗时，
+包含网络/响应处理延迟，并非服务端给出的官方通关用时。
+
+Debug 版开始挂机后生成 `logs/debug_时间戳.jsonl`，每次运行单独一个文件、逐条落盘。
+每 15 秒及切关时采集引擎/卡牌/敌人/特效配置与计时字段；首次识别还保存相关方法源码，
+以便分析整体速度、攻速、特效 CD 和概率。只读采集不修改游戏对象，不调用其方法，
+不读取 Cookie、localStorage 或完整请求，接口数据中的账号/认证字段会过滤。
+若引擎未识别，文件也会记录结果。挂机几关后点「打开数据目录」，回传这份 Debug 文件即可。
 
 ## 免责声明
 

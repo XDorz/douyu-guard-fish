@@ -14,6 +14,7 @@ from tkinter import ttk, messagebox
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 import bot as botmod  # noqa: E402
+import settings
 
 LOG_Q = queue.Queue()
 FONT = ("Microsoft YaHei UI", 10)
@@ -24,17 +25,27 @@ ONE_HIT_MODE_KEYS = {label: key for label, key in ONE_HIT_MODE_LABELS}
 
 
 class App:
-    def __init__(self, root):
+    def __init__(self, root, debug=False):
         self.root = root
+        self.debug = bool(debug)
+        self._save_job = None
+        self._config_error_logged = False
+        self._settings = dict(settings.DEFAULTS)
+        self._mode_values = {"probability": "50", "multiplier": "2"}
         self.running = False
         self.thread = None
         self.bot = None
-        root.title("保卫鱼娘 · 自动挂机助手")
+        root.title("保卫鱼娘 · 自动挂机助手 v%s%s" %
+                   (botmod.APP_VERSION, " · Debug" if self.debug else ""))
         root.geometry("1160x720")
         root.minsize(1040, 600)
         self._build()
+        self._load_config()
         self._log("[系统] 就绪。首次使用请先点「登录斗鱼」登录账号（登录态保存在本机）。")
         self._log("[系统] 数据目录：%s" % botmod.DATA_DIR)
+        self._log("[系统] 配置自动保存：%s" % botmod.CONFIG_PATH, "dim")
+        if self.debug:
+            self._log("[系统] Debug 模式：开始挂机后自动生成 logs/debug_*.jsonl 诊断文件。")
         self._log("[系统] 说明：只执行免费操作；绝技/加速/技能刷新等付费功能不会自动点击。")
         cands = botmod.chrome_candidates()
         if not cands:
@@ -161,6 +172,59 @@ class App:
                            ("win", "#2e7d32"), ("dim", "#888")):
             self.text.tag_config(tag, foreground=color)
 
+    # ---------- 配置（只在 GUI 线程读写 tkinter 变量） ----------
+    def _config_vars(self):
+        return {
+            "rid": self.rid, "rounds": self.rounds, "gap_min": self.gap_min,
+            "gap_max": self.gap_max, "hp_guard": self.hp_var,
+            "hp_threshold": self.hp_threshold, "coin_play": self.coin_var,
+            "one_hit": self.one_hit_var, "headless": self.headless_var,
+            "stop_stage": self.stop_stage, "advance_stages": self.advance_stages,
+            "max_minutes": self.max_minutes,
+        }
+
+    def _load_config(self):
+        self._settings, error = settings.load(botmod.CONFIG_PATH)
+        for key, var in self._config_vars().items():
+            var.set(self._settings[key])
+        mode = self._settings["one_hit_mode"]
+        self.one_hit_mode.set(dict((key, label) for label, key in ONE_HIT_MODE_LABELS)[mode])
+        self._last_one_hit_mode = mode
+        self._mode_values = {"probability": self._settings["one_hit_probability"],
+                             "multiplier": self._settings["attack_multiplier"]}
+        self.one_hit_value.set(self._mode_values.get(mode, "50"))
+        self._update_one_hit_mode_ui()
+        if error:
+            self._log("[系统] 配置读取失败，使用默认配置：%s" % error, "warn")
+        for var in list(self._config_vars().values()) + [self.one_hit_mode, self.one_hit_value]:
+            var.trace_add("write", self._schedule_config_save)
+
+    def _schedule_config_save(self, *_args):
+        if self._save_job is not None:
+            self.root.after_cancel(self._save_job)
+        self._save_job = self.root.after(500, self._save_config)
+
+    def _save_config(self):
+        if self._save_job is not None:
+            self.root.after_cancel(self._save_job)
+            self._save_job = None
+        values = {key: var.get() for key, var in self._config_vars().items()}
+        mode = self._one_hit_mode_key()
+        if mode in self._mode_values:
+            self._mode_values[mode] = self.one_hit_value.get()
+        values.update(one_hit_mode=mode,
+                      one_hit_probability=self._mode_values["probability"],
+                      attack_multiplier=self._mode_values["multiplier"])
+        # 输入框暂时为空或格式无效时保留上次有效值，不把半输入状态存到文件。
+        self._settings = settings.normalize(values, self._settings)
+        try:
+            settings.save(botmod.CONFIG_PATH, self._settings)
+            self._config_error_logged = False
+        except OSError as exc:
+            if not self._config_error_logged:
+                self._log("[系统] 配置保存失败：%s" % exc, "warn")
+                self._config_error_logged = True
+
     # ---------- 日志 ----------
     def _log(self, msg, tag=None):
         self.text.insert("end", msg + "\n", tag)
@@ -249,10 +313,10 @@ class App:
     def _one_hit_mode_changed(self, _event=None):
         mode = self._one_hit_mode_key()
         if mode != self._last_one_hit_mode:
-            if mode == "probability":
-                self.one_hit_value.set("50")
-            elif mode == "multiplier":
-                self.one_hit_value.set("2")
+            if self._last_one_hit_mode in self._mode_values:
+                self._mode_values[self._last_one_hit_mode] = self.one_hit_value.get()
+            if mode in self._mode_values:
+                self.one_hit_value.set(self._mode_values[mode])
             self._last_one_hit_mode = mode
         self._update_one_hit_mode_ui()
         self._runtime_options_changed()
@@ -325,6 +389,7 @@ class App:
             self.gap_min.set("%g" % gap_min)
             self.gap_max.set("%g" % gap_max)
 
+        self._save_config()
         self.running = True
         self._desired_hp_guard = bool(self.hp_var.get())
         self._desired_one_hit = bool(self.one_hit_var.get())
@@ -370,7 +435,8 @@ class App:
                                            advance_stages=advance_stages,
                                            one_hit_mode=one_hit_mode,
                                            one_hit_probability=one_hit_probability,
-                                           attack_multiplier=attack_multiplier)
+                                           attack_multiplier=attack_multiplier,
+                                           debug=self.debug)
             # 如果用户在工作线程刚启动的瞬间点击了复选框，以当前 GUI 值为准。
             self.bot.set_runtime_controls(hp_guard=self._desired_hp_guard,
                                           one_hit=self._desired_one_hit,
@@ -433,21 +499,23 @@ class App:
             if not messagebox.askokcancel("退出", "挂机还在运行，确定退出？\n（战斗中退出会导致当前一场作废）"):
                 return
             self.bot.request_stop()
+        self._save_config()
         self.root.destroy()
 
 
-def main():
+def main(debug=False):
     argv = sys.argv[1:]
+    debug = debug or "--debug" in argv
     # 有命令行参数时走 bot.py 的 CLI（--run / --login / --selftest）
-    if any(a.startswith("-") for a in argv):
-        botmod.main()
+    if any(a.startswith("-") and a != "--debug" for a in argv):
+        botmod.main(default_debug=debug)
         return
     root = tk.Tk()
     try:
         root.call("tk", "scaling", 1.15)
     except Exception:
         pass
-    App(root)
+    App(root, debug=debug)
     root.mainloop()
 
 

@@ -6,43 +6,108 @@ on:
     tags:
       - "v*"
 
-jobs:
-  build:
-    runs-on: windows-latest
-    permissions:
-      contents: read
+permissions:
+  contents: read
 
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate release version
+        id: version
+        shell: bash
+        run: |
+          version=$(tr -d '\r\n' < VERSION)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "VERSION must be x.y.z"; exit 1; }
+          tag="v$version"
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "$tag" ]]; then
+            echo "Tag must match VERSION ($tag)"
+            exit 1
+          fi
+          if git rev-parse --verify "refs/tags/$tag" >/dev/null 2>&1; then
+            tagged_sha=$(git rev-parse "refs/tags/$tag^{commit}")
+            current_sha=$(git rev-parse HEAD)
+            [[ "$tagged_sha" == "$current_sha" ]] || { echo "Bump VERSION before publishing a new commit"; exit 1; }
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [standard, debug]
+    env:
+      PYTHONUTF8: "1"
+      GUARD_FISH_BUILD_FLAVOR: ${{ matrix.flavor }}
+      RELEASE_TAG: ${{ needs.version.outputs.tag }}
     steps:
       - name: Check out source
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install build dependencies
         shell: pwsh
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install playwright pyinstaller
-
-      - name: Build one-file executable
+        run: python -m pip install playwright pyinstaller
+      - name: Run regression checks
+        shell: pwsh
+        run: python -m unittest discover -s tests -v
+      - name: Build executable
         shell: pwsh
         run: |
-          if (Test-Path "保卫鱼娘自动挂机") { Remove-Item -Recurse -Force "保卫鱼娘自动挂机" }
-          if (Test-Path "_build_tmp") { Remove-Item -Recurse -Force "_build_tmp" }
-          python -m PyInstaller --noconfirm --distpath "保卫鱼娘自动挂机" --workpath "_build_tmp" yu_gui.spec
-
-      - name: Package artifact
-        shell: pwsh
-        run: |
-          $zip = "guard-fish-assistant-${{ github.run_number }}-win64.zip"
-          Compress-Archive -Path "保卫鱼娘自动挂机\*" -DestinationPath $zip -Force
-
-      - name: Upload Windows package
+          python -m PyInstaller --noconfirm --distpath out --workpath _build_tmp yu_gui.spec
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $suffix = if ($env:GUARD_FISH_BUILD_FLAVOR -eq "debug") { "-debug" } else { "" }
+          $exe = Get-ChildItem out -Filter *.exe | Select-Object -First 1
+          if (-not $exe) { throw "No EXE was built" }
+          Rename-Item -Path $exe.FullName -NewName ("guard-fish-assistant-{0}{1}-win64.exe" -f $env:RELEASE_TAG, $suffix)
+      - name: Upload executable
         uses: actions/upload-artifact@v4
         with:
-          name: guard-fish-assistant-${{ github.run_number }}-win64
-          path: guard-fish-assistant-${{ github.run_number }}-win64.zip
+          name: windows-${{ matrix.flavor }}
+          path: out/*.exe
           if-no-files-found: error
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: windows-*
+          path: release-assets
+          merge-multiple: true
+      - name: Publish EXEs to GitHub Release
+        shell: bash
+        run: |
+          count=$(find release-assets -maxdepth 1 -name '*.exe' | wc -l)
+          [[ "$count" == 2 ]] || { echo "Expected both standard and debug EXEs"; exit 1; }
+          commit=$(git rev-parse HEAD)
+          cp RELEASE_NOTES.md "$RUNNER_TEMP/release-notes.md"
+          printf '\n构建提交：`%s`\n' "$commit" >> "$RUNNER_TEMP/release-notes.md"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/*.exe --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/*.exe \
+              --target "$commit" --title "$RELEASE_TAG" --latest \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi
