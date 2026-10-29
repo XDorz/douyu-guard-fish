@@ -63,6 +63,10 @@ python bot.py --run --rounds 1   # 命令行
 
 产物：`保卫鱼娘自动挂机\保卫鱼娘助手.exe`。需要完整版 Python（自带 tkinter）。
 
+仓库中的 `.github/workflows/build-windows.yml` 可在 GitHub Actions 的 `workflow_dispatch`
+手动触发，也会在推送 `v*` 标签时自动构建。构建结果以 Windows ZIP artifact 提供；GitHub runner
+只负责编译，不需要安装 Chrome，运行时仍使用用户电脑上的 Chrome/Edge。
+
 Playwright 官方没有 PyInstaller hook，`yu_gui.spec` 里手动把 `site-packages/playwright/driver`（node.exe + cli.js，约 102MB）打进了包。
 
 ## 项目结构

@@ -1075,11 +1075,11 @@ class GuardFishBot:
             if not self._install_runtime_script():
                 return None
             try:
-                self._page.evaluate(JS_HP_CFG, {
-                    "hpGuard": False, "oneHit": False, "threshold": threshold,
-                    "discover": True, "maxRefillMs": self.max_battle_seconds * 1000,
-                })
                 if not natural_sent:
+                    self._page.evaluate(JS_HP_CFG, {
+                        "hpGuard": False, "oneHit": False, "threshold": threshold,
+                        "discover": True, "maxRefillMs": self.max_battle_seconds * 1000,
+                    })
                     r = self._page.evaluate(JS_HP_END)
                     if isinstance(r, dict) and (r.get("ok") or r.get("pending")):
                         with self._control_lock:
