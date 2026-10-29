@@ -92,7 +92,7 @@ class App:
         self.start_btn = tk.Button(top, text="开始挂机", width=11, font=FONT_B,
                                    bg="#43a047", fg="white", command=self.start)
         self.start_btn.grid(row=0, column=9, padx=(0, 8))
-        self.stop_btn = tk.Button(top, text="紧急停止", width=8, font=FONT_B,
+        self.stop_btn = tk.Button(top, text="终止并退出", width=10, font=FONT_B,
                                   state="disabled", command=self.stop)
         self.stop_btn.grid(row=0, column=10, padx=(0, 14))
 
@@ -103,28 +103,27 @@ class App:
         ttk.Button(top, text="打开数据目录", width=12, command=self.open_dir).grid(row=0, column=13)
 
         # 关卡目标和单场监控时限。两个关卡目标同时设置时取较大的实际关卡数。
-        ttk.Label(top, text="打到第", font=FONT).grid(row=2, column=0, sticky="w", pady=(8, 0))
+        # 每个配置使用一个紧凑的小组，避免 grid 跨列后产生过大的组内间距。
         self.stop_stage = tk.StringVar(value="0")
-        ttk.Entry(top, textvariable=self.stop_stage, width=6, font=FONT).grid(row=2, column=1,
-                                                                                padx=(4, 2), pady=(8, 0))
-        ttk.Label(top, text="关结束(0=关)", font=FONT_S, foreground="#666").grid(row=2, column=2,
-                                                                                     sticky="w", pady=(8, 0))
-        ttk.Label(top, text="推进", font=FONT).grid(row=2, column=3, sticky="w", pady=(8, 0))
         self.advance_stages = tk.StringVar(value="0")
-        ttk.Entry(top, textvariable=self.advance_stages, width=6, font=FONT).grid(row=2, column=4,
-                                                                                   padx=(4, 2), pady=(8, 0))
-        ttk.Label(top, text="关后结束(0=关)", font=FONT_S, foreground="#666").grid(row=2, column=5,
-                                                                                       sticky="w", pady=(8, 0))
-        ttk.Label(top, text="单场最长", font=FONT).grid(row=2, column=6, sticky="w", pady=(8, 0))
         self.max_minutes = tk.StringVar(value="13")
-        ttk.Entry(top, textvariable=self.max_minutes, width=6, font=FONT).grid(row=2, column=7,
-                                                                                padx=(4, 2), pady=(8, 0))
-        ttk.Label(top, text="分钟", font=FONT_S, foreground="#666").grid(row=2, column=8,
-                                                                            sticky="w", pady=(8, 0))
+        target_row = ttk.Frame(top)
+        target_row.grid(row=2, column=0, columnspan=14, sticky="w", pady=(8, 0))
+
+        def target_group(title, variable, suffix):
+            group = ttk.Frame(target_row)
+            group.pack(side="left", padx=(0, 16))
+            ttk.Label(group, text=title, font=FONT).pack(side="left")
+            ttk.Entry(group, textvariable=variable, width=6, font=FONT).pack(side="left", padx=(5, 2))
+            ttk.Label(group, text=suffix, font=FONT_S, foreground="#666").pack(side="left")
+
+        target_group("固定关卡", self.stop_stage, "关结束（0=关）")
+        target_group("推进", self.advance_stages, "关后结束（0=关）")
+        target_group("单场最长", self.max_minutes, "分钟")
 
         tips = ttk.Label(top, text="每日免费挑战 10 次；免费用尽后若银币 ≥10 会自动用银币续打（银币为免费获取；"
                                    "绝技/加速等需鱼翅付费的功能一律不会点击）。"
-                                   "‘本场正常结束’会把基地降到 1 血并等待游戏结算；‘紧急停止’会作废当前场。",
+                                   "‘本场正常结束’会把基地降到 1 血并等待游戏结算；‘终止并退出’会作废当前场。",
                          font=FONT_S, foreground="#666")
         tips.grid(row=3, column=0, columnspan=14, sticky="w", pady=(8, 0))
 
@@ -336,7 +335,7 @@ class App:
     def stop(self):
         if self.bot:
             self.bot.request_stop()
-            self._log("[系统] 紧急停止中…（会关闭浏览器，当前场可能作废）", "warn")
+            self._log("[系统] 终止并退出中…（会关闭浏览器，当前场可能作废）", "warn")
         self.stop_btn.config(state="disabled")
 
     def on_close(self):

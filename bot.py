@@ -586,6 +586,7 @@ JS_HP_DRAIN = r"""
   const ev = gf.hpEvents ? gf.hpEvents.splice(0, 200) : [];
   return {refills: gf.refills || 0, wrapped: !!gf.wrapped, found: !!gf.mgrRef,
           comp: gf.comp || '', hp: gf.hp,
+          hpGuard: !!gf.hpGuard, enabled: !!gf.enabled, discover: !!gf.discover,
           oneHit: !!gf.oneHit, oneHitWrapped: !!gf.oneHitWrapped,
           oneHitKills: gf.oneHitKills || 0,
           endRequested: !!gf.endRequested, endApplied: !!gf.endApplied,
@@ -970,13 +971,21 @@ class GuardFishBot:
                 self.hp_threshold = max(int(hp_threshold), 1)
             self._runtime_pending = True
 
+    def _reset_battle_controls(self):
+        """开始新场前清除上一场的自然结束状态，并强制重新同步页面开关。"""
+        with self._control_lock:
+            self._natural_end_requested = False
+            self._natural_end_sent = False
+            self._natural_end_reason = ""
+            self._runtime_pending = True
+            self._runtime_applied = None
+
     def request_natural_end(self, reason="用户请求"):
         """请求本场把基地降到 1 血，让游戏自己的失败/结算流程收尾。"""
         with self._control_lock:
             if not self._natural_end_requested:
                 self._natural_end_reason = str(reason)
             self._natural_end_requested = True
-            self._stop_after_battle = True
         self._log("已请求本场正常结束：%s（将基地降到 1 血，等待游戏结算）" % reason, "warn")
 
     def _log(self, msg, level="info"):
@@ -1527,8 +1536,13 @@ class GuardFishBot:
             self._log("已在运行中", "warn")
             return
         self._stop.clear()
-        self._natural_end_sent = False
-        self._stop_after_battle = False
+        with self._control_lock:
+            self._natural_end_requested = False
+            self._natural_end_sent = False
+            self._natural_end_reason = ""
+            self._runtime_pending = True
+            self._runtime_applied = None
+            self._stop_after_battle = False
         self._thread = threading.Thread(target=self._run, name="guardfish-bot", daemon=True)
         self._thread.start()
 
@@ -1619,6 +1633,8 @@ class GuardFishBot:
 
     def _one_battle(self, idx):
         """打一场，返回统计 dict 或 None"""
+        # 自然结束只属于上一场；若不清理，下一场会刚进入战斗就再次被降到 1 血。
+        self._reset_battle_controls()
         self.status["state"] = "准备开局"
         self._stage_target = None
         self._stage_stop_announced = False
@@ -1714,6 +1730,9 @@ class GuardFishBot:
                 self._log("进入自然结束宽限期（最多 %d 秒）" % END_GRACE_SECONDS, "warn")
             if end_started is not None and time.time() - end_started > END_GRACE_SECONDS:
                 ended = "超时未结算"
+                with self._control_lock:
+                    # 只有自然结束未能结算时才阻止继续开新场。
+                    self._stop_after_battle = True
                 self._log("自然结束后 %d 秒仍未出现结算，停止继续开新场，避免同一对局被重复计场。" % END_GRACE_SECONDS,
                           "error")
                 break
@@ -1750,7 +1769,12 @@ class GuardFishBot:
             if gf:
                 if gf.get("found") and not hp_found_logged:
                     hp_found_logged = True
-                    self._log("回血守护已接管（%s）" % (gf.get("comp") or "engine"))
+                    modes = "回血守护：%s｜秒杀模式：%s" % (
+                        "开" if gf.get("hpGuard") else "关",
+                        "开" if gf.get("oneHit") else "关")
+                    self._log("战斗引擎已识别（%s）｜%s" %
+                              (gf.get("comp") or "engine", modes),
+                              "dim" if not gf.get("hpGuard") else "info")
                 if gf.get("err"):
                     self._log("回血守护异常：%s" % str(gf.get("err"))[:120], "warn")
                 if gf.get("oneHitKills") is not None:
@@ -1812,14 +1836,14 @@ class GuardFishBot:
                              wm.get("freeNum", "?"), hp_refill_count,
                              (" 秒杀=%d" % self._one_hit_kills) if self.one_hit else ""))
 
-            # 3.1 结算（只有真正的结算弹窗才算本场结束；宝箱弹窗不算）
+            # 3.1 结算（顶部进度宝箱也可能使用 Result-module；必须确认战斗已结束）
             if st.get("result") or st.get("treasure"):
-                had_result = bool(st.get("result"))
-                if had_result:
-                    result_text = self._click(JS_RESULT_TEXT) or ""
+                modal_result = bool(st.get("result"))
+                candidate_result_text = self._click(JS_RESULT_TEXT) if modal_result else ""
                 r = self._click(JS_RESULT_BTN)
-                self._log("%s弹窗 → %s %s" % ("结算" if had_result else "奖励", r,
-                                              ("｜" + result_text[:120]) if result_text else ""))
+                self._log("%s弹窗 → %s %s" %
+                          ("结算候选" if modal_result else "奖励",
+                           r, ("｜" + candidate_result_text[:120]) if candidate_result_text else ""))
                 time.sleep(2.0)
                 st2 = self._state() or {}
                 if st2.get("treasure"):
@@ -1827,9 +1851,17 @@ class GuardFishBot:
                     self._log("奖励弹窗 → %s" % r2)
                     time.sleep(1.5)
                 st3 = self._state() or {}
-                if had_result and not st3.get("result") and not st3.get("treasure"):
+                wm3 = st3.get("wm") or {}
+                battle_over_after = bool(wm3.get("battleOver"))
+                returned_to_lobby = bool(st3.get("canChallenge"))
+                actual_result = bool(modal_result and
+                                     (battle_over_after or returned_to_lobby))
+                if actual_result and not st3.get("result") and not st3.get("treasure"):
+                    result_text = candidate_result_text or ""
                     ended = "结算完成"
                     break
+                if modal_result and not actual_result:
+                    self._log("奖励弹窗已关闭，战斗仍在继续，忽略本次弹窗作为结束信号。", "dim")
 
             # 3.2 关卡技能三选一
             cards = st.get("skillPanel")
