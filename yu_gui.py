@@ -28,8 +28,8 @@ class App:
         self.thread = None
         self.bot = None
         root.title("保卫鱼娘 · 自动挂机助手")
-        root.geometry("1020x660")
-        root.minsize(940, 560)
+        root.geometry("1160x720")
+        root.minsize(1040, 600)
         self._build()
         self._log("[系统] 就绪。首次使用请先点「登录斗鱼」登录账号（登录态保存在本机）。")
         self._log("[系统] 数据目录：%s" % botmod.DATA_DIR)
@@ -66,9 +66,12 @@ class App:
         hp_frame = ttk.Frame(top)
         hp_frame.grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
         self.hp_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(hp_frame, text="血量低于", variable=self.hp_var).pack(side="left")
+        ttk.Checkbutton(hp_frame, text="血量低于", variable=self.hp_var,
+                        command=self._runtime_options_changed).pack(side="left")
         self.hp_threshold = tk.StringVar(value="5")
-        ttk.Entry(hp_frame, textvariable=self.hp_threshold, width=4, font=FONT).pack(side="left", padx=3)
+        hp_entry = ttk.Entry(hp_frame, textvariable=self.hp_threshold, width=4, font=FONT)
+        hp_entry.pack(side="left", padx=3)
+        hp_entry.bind("<Return>", lambda _e: self._runtime_options_changed())
         ttk.Label(hp_frame, text="滴自动回满", font=FONT_S, foreground="#666").pack(side="left")
 
         # 银币续打：免费用尽后花银币继续（银币免费获取，不用鱼翅）
@@ -79,8 +82,9 @@ class App:
         # 秒杀模式：我方 9 张卡造成的任何伤害直接击杀怪物
         self.one_hit_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(top, text="秒杀模式（卡牌伤害直接击杀）",
-                        variable=self.one_hit_var).grid(row=1, column=9, columnspan=4,
-                                                        sticky="w", pady=(8, 0))
+                        variable=self.one_hit_var,
+                        command=self._runtime_options_changed).grid(row=1, column=9, columnspan=5,
+                                                                   sticky="w", pady=(8, 0))
 
         self.headless_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(top, text="后台运行(隐藏浏览器)", variable=self.headless_var).grid(row=0, column=8, padx=(0, 14))
@@ -88,18 +92,41 @@ class App:
         self.start_btn = tk.Button(top, text="开始挂机", width=11, font=FONT_B,
                                    bg="#43a047", fg="white", command=self.start)
         self.start_btn.grid(row=0, column=9, padx=(0, 8))
-        self.stop_btn = tk.Button(top, text="停止", width=7, font=FONT_B,
+        self.stop_btn = tk.Button(top, text="紧急停止", width=8, font=FONT_B,
                                   state="disabled", command=self.stop)
         self.stop_btn.grid(row=0, column=10, padx=(0, 14))
 
-        ttk.Button(top, text="登录斗鱼", width=10, command=self.login).grid(row=0, column=11, padx=(0, 6))
-        ttk.Button(top, text="打开数据目录", width=12, command=self.open_dir).grid(row=0, column=12)
+        self.end_btn = tk.Button(top, text="本场正常结束", width=12, font=FONT_B,
+                                 state="disabled", command=self.end_current)
+        self.end_btn.grid(row=0, column=11, padx=(0, 8))
+        ttk.Button(top, text="登录斗鱼", width=10, command=self.login).grid(row=0, column=12, padx=(0, 6))
+        ttk.Button(top, text="打开数据目录", width=12, command=self.open_dir).grid(row=0, column=13)
+
+        # 关卡目标和单场监控时限。两个关卡目标同时设置时取较大的实际关卡数。
+        ttk.Label(top, text="打到第", font=FONT).grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.stop_stage = tk.StringVar(value="0")
+        ttk.Entry(top, textvariable=self.stop_stage, width=6, font=FONT).grid(row=2, column=1,
+                                                                                padx=(4, 2), pady=(8, 0))
+        ttk.Label(top, text="关结束(0=关)", font=FONT_S, foreground="#666").grid(row=2, column=2,
+                                                                                     sticky="w", pady=(8, 0))
+        ttk.Label(top, text="推进", font=FONT).grid(row=2, column=3, sticky="w", pady=(8, 0))
+        self.advance_stages = tk.StringVar(value="0")
+        ttk.Entry(top, textvariable=self.advance_stages, width=6, font=FONT).grid(row=2, column=4,
+                                                                                   padx=(4, 2), pady=(8, 0))
+        ttk.Label(top, text="关后结束(0=关)", font=FONT_S, foreground="#666").grid(row=2, column=5,
+                                                                                       sticky="w", pady=(8, 0))
+        ttk.Label(top, text="单场最长", font=FONT).grid(row=2, column=6, sticky="w", pady=(8, 0))
+        self.max_minutes = tk.StringVar(value="13")
+        ttk.Entry(top, textvariable=self.max_minutes, width=6, font=FONT).grid(row=2, column=7,
+                                                                                padx=(4, 2), pady=(8, 0))
+        ttk.Label(top, text="分钟", font=FONT_S, foreground="#666").grid(row=2, column=8,
+                                                                            sticky="w", pady=(8, 0))
 
         tips = ttk.Label(top, text="每日免费挑战 10 次；免费用尽后若银币 ≥10 会自动用银币续打（银币为免费获取；"
                                    "绝技/加速等需鱼翅付费的功能一律不会点击）。"
-                                   "中途停止或关闭会导致当前一场作废，建议打完一场再停。",
+                                   "‘本场正常结束’会把基地降到 1 血并等待游戏结算；‘紧急停止’会作废当前场。",
                          font=FONT_S, foreground="#666")
-        tips.grid(row=2, column=0, columnspan=13, sticky="w", pady=(8, 0))
+        tips.grid(row=3, column=0, columnspan=14, sticky="w", pady=(8, 0))
 
         self.status = tk.StringVar(value="状态：未运行")
         ttk.Label(self.root, textvariable=self.status, anchor="w", padding=(10, 5),
@@ -163,9 +190,30 @@ class App:
             pass
         except Exception:
             pass
+        if hasattr(self, "end_btn"):
+            active = bool(self.running and self.bot and self.bot._battle_active
+                          and not self.bot._natural_end_requested)
+            self.end_btn.config(state="normal" if active else "disabled")
         self.root.after(150, self._pump)
 
     # ---------- 控制 ----------
+    def _runtime_options_changed(self):
+        """复选框点击后通知运行线程；Playwright 调用仍在机器人线程中执行。"""
+        self._desired_hp_guard = bool(self.hp_var.get())
+        self._desired_one_hit = bool(self.one_hit_var.get())
+        if not (self.running and self.bot):
+            return
+        try:
+            threshold = int((self.hp_threshold.get() or "5").strip() or 5)
+        except ValueError:
+            threshold = 5
+        self.bot.set_runtime_controls(hp_guard=self.hp_var.get(),
+                                      one_hit=self.one_hit_var.get(),
+                                      hp_threshold=max(threshold, 1))
+        self._log("[系统] 已提交实时开关：回血=%s，秒杀=%s（约半秒内生效）"
+                  % ("开" if self.hp_var.get() else "关",
+                     "开" if self.one_hit_var.get() else "关"), "dim")
+
     def start(self):
         if self.running:
             return
@@ -180,11 +228,20 @@ class App:
             gap_min = float((self.gap_min.get() or "0").strip() or 0)
             gap_max = float((self.gap_max.get() or "0").strip() or 0)
             hp_th = int((self.hp_threshold.get() or "5").strip() or 5)
+            stop_stage = int((self.stop_stage.get() or "0").strip() or 0)
+            advance_stages = int((self.advance_stages.get() or "0").strip() or 0)
+            max_minutes = float((self.max_minutes.get() or "13").strip() or 13)
         except ValueError:
-            messagebox.showwarning("输入错误", "房间号/场数/等待时间/回血阈值格式不对")
+            messagebox.showwarning("输入错误", "房间号/场数/等待时间/回血阈值/关卡目标/时限格式不对")
             return
         if rounds < 0:
             messagebox.showwarning("输入错误", "场数不能为负数（0=不限）")
+            return
+        if stop_stage < 0 or advance_stages < 0:
+            messagebox.showwarning("输入错误", "关卡目标不能为负数（0=关闭）")
+            return
+        if max_minutes <= 0:
+            messagebox.showwarning("输入错误", "单场最长时间必须大于 0 分钟")
             return
         if hp_th < 1:
             hp_th = 1
@@ -194,12 +251,16 @@ class App:
             self.gap_max.set("%g" % gap_max)
 
         self.running = True
+        self._desired_hp_guard = bool(self.hp_var.get())
+        self._desired_one_hit = bool(self.one_hit_var.get())
         self._hud = ""
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self._log("[系统] 开始挂机：房间 %s，场数 %s，场间等待 %.0f~%.0f 秒%s"
                   % (rid, rounds if rounds > 0 else "不限", gap_min, gap_max,
                      "（后台模式）" if self.headless_var.get() else ""))
+        self._log("[系统] 单场最长时间：%.1f 分钟；绝对关卡目标：%s；推进目标：%s"
+                  % (max_minutes, stop_stage or "关", advance_stages or "关"))
         if self.hp_var.get():
             self._log("[系统] 回血守护：开（血量 < %d 自动回满）" % hp_th)
         self._log("[系统] 银币续打：%s" % ("开（免费用尽后银币≥10 自动继续）" if self.coin_var.get() else "关"))
@@ -208,17 +269,25 @@ class App:
         self.thread = threading.Thread(target=self._run,
                                        args=(rid, rounds, gap_min, gap_max, self.headless_var.get(),
                                              self.hp_var.get(), hp_th, self.coin_var.get(),
-                                             self.one_hit_var.get()),
+                                             self.one_hit_var.get(), max_minutes * 60,
+                                             stop_stage, advance_stages),
                                        daemon=True)
         self.thread.start()
 
     def _run(self, rid, rounds, gap_min, gap_max, headless, hp_guard, hp_th, coin_play,
-             one_hit=False):
+             one_hit=False, max_battle_seconds=botmod.MAX_BATTLE_SECONDS,
+             stop_stage=0, advance_stages=0):
         try:
             self.bot = botmod.GuardFishBot(rid=rid, rounds=rounds, gap_min=gap_min,
                                            gap_max=gap_max, headless=headless,
                                            hp_guard=hp_guard, hp_threshold=hp_th,
-                                           coin_play=coin_play, one_hit=one_hit)
+                                           coin_play=coin_play, one_hit=one_hit,
+                                           max_battle_seconds=max_battle_seconds,
+                                           stop_stage=stop_stage,
+                                           advance_stages=advance_stages)
+            # 如果用户在工作线程刚启动的瞬间点击了复选框，以当前 GUI 值为准。
+            self.bot.set_runtime_controls(hp_guard=self._desired_hp_guard,
+                                          one_hit=self._desired_one_hit)
             self.bot.add_log_sink(lambda line, level=None: LOG_Q.put((line, level)))
             self.bot.start()
             self.bot._thread.join()
@@ -231,6 +300,7 @@ class App:
     def _on_finished(self):
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
+        self.end_btn.config(state="disabled")
         self.status.set("状态：已停止")
         self._log("[系统] 已停止")
 
@@ -257,10 +327,16 @@ class App:
         except Exception as e:
             messagebox.showwarning("打不开", str(e))
 
+    def end_current(self):
+        if self.running and self.bot and self.bot._battle_active:
+            self.bot.request_natural_end("GUI 点击")
+            self.end_btn.config(state="disabled")
+            self._log("[系统] 已请求本场正常结束，等待游戏结算…", "warn")
+
     def stop(self):
         if self.bot:
             self.bot.request_stop()
-            self._log("[系统] 停止中…（等待当前动作收尾；战斗中停止会导致本场作废）")
+            self._log("[系统] 紧急停止中…（会关闭浏览器，当前场可能作废）", "warn")
         self.stop_btn.config(state="disabled")
 
     def on_close(self):

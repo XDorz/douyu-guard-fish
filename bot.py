@@ -32,6 +32,7 @@ GAME_URL = "https://www.douyu.com/pages/vibe-lab-act202606-game/mine?rid={rid}&i
 HOME_URL = "https://www.douyu.com/"
 
 MAX_BATTLE_SECONDS = 13 * 60      # 单场最长等待（服务端上限 600s + 余量）
+END_GRACE_SECONDS = 45             # 请求自然结束后等待结算的宽限时间
 TICK = 0.5                         # 状态轮询间隔
 IDLE_STUCK_LIMIT = 90              # 空闲态卡住多久后尝试恢复（刷新页面）
 PRE_BATTLE_LIMIT = 90              # 点挑战后"无进展"超时（每有进展会重新计时）
@@ -272,8 +273,10 @@ def launch_persistent(pw, user_data_dir, headless=False):
 FAKE_DEVTOOLS_HOOK = r"""
 (() => {
   try {
+    const hadHook = !!window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
     let hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
     if (!hook) hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__ = {};
+    if (!hadHook) window.__GF_CREATED_REACT_HOOK__ = true;
     if (!hook.renderers) hook.renderers = new Map();
     if (typeof hook.inject !== 'function') {
       let nextId = 1;
@@ -298,11 +301,13 @@ FAKE_DEVTOOLS_HOOK = r"""
 JS_HP_WATCH = r"""
 (() => {
   if (window.__GF) return 'exists';
-  const GF = window.__GF = {enabled: true, hpGuard: true, threshold: 5, refills: 0, hpEvents: [], hp: null,
+  const GF = window.__GF = {enabled: false, hpGuard: false, threshold: 5, refills: 0, hpEvents: [], hp: null,
                             mgrRef: null, loopRef: null, wrapped: false, foundOnce: false,
                             fullHp: 0,
                             battleT0: 0, maxRefillMs: 540000, capped: false,
                             oneHit: false, oneHitKills: 0, oneHitWrapped: false,
+                            discover: false, endRequested: false, endApplied: false,
+                            intervalId: null, wrappedLoops: [],
                             scanCount: 0, scanInfo: null, diag: null, err: null, comp: ''};
   // 解析：ref.current 可能是 BattleLoop（直接含 coreHp）或 BattleManager（显示层，coreHp 在 .loop 里）
   function resolveTarget(c) {
@@ -384,6 +389,50 @@ JS_HP_WATCH = r"""
     return res;
   }
   window.__gfScan = scanTree;
+  function restoreLoop(loop) {
+    if (!loop) return;
+    try {
+      if (loop.__gfCheckHadOwn) loop._checkEnemiesReachedCore = loop.__gfCheckOriginal;
+      else if (loop.__gfWrapped) delete loop._checkEnemiesReachedCore;
+      delete loop.__gfCheckOriginal;
+      delete loop.__gfCheckHadOwn;
+      delete loop.__gfWrapped;
+    } catch (e) {}
+    try {
+      if (loop.__gfDealHadOwn) loop._dealDamage = loop.__gfDealOriginal;
+      else if (loop.__gfOneHitWrapped) delete loop._dealDamage;
+      delete loop.__gfDealOriginal;
+      delete loop.__gfDealHadOwn;
+      delete loop.__gfOneHitWrapped;
+    } catch (e) {}
+  }
+  window.__gfRestoreLoop = restoreLoop;
+  function forceEnd(loop, tag) {
+    try {
+      if (!loop || typeof loop.coreHp !== 'number' || loop.running === false) return false;
+      GF.hpGuard = false;
+      GF.oneHit = false;
+      const before = loop.coreHp;
+      loop.coreHp = 1;
+      if (loop.callbacks && typeof loop.callbacks.onCoreHpChanged === 'function')
+        loop.callbacks.onCoreHpChanged(1, 1);
+      GF.endRequested = false;
+      GF.endApplied = true;
+      GF.enabled = false;
+      GF.hpEvents.push({t: Date.now(), type: 'end', from: before, to: 1, tag: tag || 'request'});
+      return true;
+    } catch (e) { GF.err = String(e); return false; }
+  }
+  window.__gfRequestEnd = () => {
+    GF.endRequested = true;
+    GF.discover = true;
+    GF.enabled = true;
+    let cur = GF.mgrRef && GF.mgrRef.current;
+    let t = resolveTarget(cur);
+    if (!t) { scanTree(); cur = GF.mgrRef && GF.mgrRef.current; t = resolveTarget(cur); }
+    if (t && forceEnd(t.loop, 'request')) return {ok: true, applied: true};
+    return {ok: false, pending: true, why: 'engine-not-found'};
+  };
   function refill(loop, tag) {
     try {
       if (!GF.hpGuard) return;
@@ -415,9 +464,9 @@ JS_HP_WATCH = r"""
   window.__gfRefill = refill;
   let lastHp = null;
   let lastScan = 0;
-  setInterval(() => {
+  GF.intervalId = setInterval(() => {
     try {
-      if (!GF.enabled) return;
+      if (!GF.enabled && !GF.endRequested) return;
       let cur = GF.mgrRef && GF.mgrRef.current;
       let t = resolveTarget(cur);
       if (!t || typeof t.loop.coreHp !== 'number') {
@@ -429,12 +478,15 @@ JS_HP_WATCH = r"""
       if (!t || typeof t.loop.coreHp !== 'number') return;
       const loop = t.loop;
       GF.loopRef = loop;
+      if (GF.endRequested && forceEnd(loop, 'watch')) return;
       if (!GF.battleT0) { GF.battleT0 = Date.now(); GF.capped = false; }
-      if (!loop.__gfWrapped) {
+      if (GF.hpGuard && !loop.__gfWrapped) {
         try {
           const proto = Object.getPrototypeOf(loop);
           const fn = loop._checkEnemiesReachedCore || (proto && proto._checkEnemiesReachedCore);
           if (typeof fn === 'function') {
+            const hadOwn = Object.prototype.hasOwnProperty.call(loop, '_checkEnemiesReachedCore');
+            const original = loop._checkEnemiesReachedCore;
             const orig = fn.bind(loop);
             loop._checkEnemiesReachedCore = function () {
               try { if (this.coreHp <= GF.threshold) refill(this, 'pre'); } catch (e) {}
@@ -442,18 +494,23 @@ JS_HP_WATCH = r"""
               try { refill(this, 'post'); } catch (e) {}
               return r;
             };
+            loop.__gfCheckHadOwn = hadOwn;
+            loop.__gfCheckOriginal = original;
             loop.__gfWrapped = true; GF.wrapped = true;
+            if (GF.wrappedLoops.indexOf(loop) < 0) GF.wrappedLoops.push(loop);
           }
         } catch (e) { GF.err = String(e); }
       }
       // 秒杀：包装 _dealDamage，把本次伤害抬到「恰好等于敌人当前血量」。
       // 原实现 actualDmg = min(max(1,floor(damage)), enemy.currentHp)，因此传 currentHp
       // 必然打成 0 → 走原生的 _killEnemy（伤害统计/击杀回调/掉落/清关判定全部保留）。
-      if (!loop.__gfOneHitWrapped) {
+      if (GF.oneHit && !loop.__gfOneHitWrapped) {
         try {
           const proto2 = Object.getPrototypeOf(loop);
           const orig2 = loop._dealDamage || (proto2 && proto2._dealDamage);
           if (typeof orig2 === 'function') {
+            const hadOwn2 = Object.prototype.hasOwnProperty.call(loop, '_dealDamage');
+            const original2 = loop._dealDamage;
             loop._dealDamage = function (enemy, damage, cardId, isCrit) {
               try {
                 if (GF.oneHit && enemy && typeof enemy.currentHp === 'number' && enemy.currentHp > 0) {
@@ -463,7 +520,10 @@ JS_HP_WATCH = r"""
               } catch (e) { GF.err = String(e); }
               return orig2.call(this, enemy, damage, cardId, isCrit);
             };
+            loop.__gfDealHadOwn = hadOwn2;
+            loop.__gfDealOriginal = original2;
             loop.__gfOneHitWrapped = true; GF.oneHitWrapped = true;
+            if (GF.wrappedLoops.indexOf(loop) < 0) GF.wrappedLoops.push(loop);
           }
         } catch (e) { GF.err = String(e); }
       }
@@ -488,10 +548,34 @@ JS_HP_CFG = r"""
   if (cfg && cfg.hpGuard !== undefined) window.__GF.hpGuard = !!cfg.hpGuard;
   if (cfg && cfg.threshold !== undefined) window.__GF.threshold = Number(cfg.threshold) || 5;
   if (cfg && cfg.oneHit !== undefined) window.__GF.oneHit = !!cfg.oneHit;
-  // 守护循环（250ms）只要「回血」或「秒杀」有一个开着就要跑
-  window.__GF.enabled = !!(window.__GF.hpGuard || window.__GF.oneHit);
+  if (cfg && cfg.discover !== undefined) window.__GF.discover = !!cfg.discover;
+  if (cfg && cfg.maxRefillMs !== undefined) window.__GF.maxRefillMs = Math.max(0, Number(cfg.maxRefillMs) || 0);
+  // 守护循环（250ms）只要功能开启、正在寻找引擎或等待结束就运行
+  window.__GF.enabled = !!(window.__GF.hpGuard || window.__GF.oneHit || window.__GF.discover || window.__GF.endRequested);
   return {hpGuard: window.__GF.hpGuard, enabled: window.__GF.enabled,
-          threshold: window.__GF.threshold, oneHit: window.__GF.oneHit};
+          threshold: window.__GF.threshold, oneHit: window.__GF.oneHit,
+          discover: !!window.__GF.discover, endRequested: !!window.__GF.endRequested};
+}
+"""
+
+JS_HP_END = r"""
+() => {
+  if (!window.__GF || typeof window.__gfRequestEnd !== 'function')
+    return {ok: false, pending: false, why: 'runtime-not-loaded'};
+  return window.__gfRequestEnd();
+}
+"""
+
+JS_HP_UNLOAD = r"""
+() => {
+  const gf = window.__GF;
+  if (!gf) return {ok: true, unloaded: false};
+  try { gf.enabled = false; gf.endRequested = false; } catch (e) {}
+  try { if (gf.intervalId) clearInterval(gf.intervalId); } catch (e) {}
+  try { for (const loop of (gf.wrappedLoops || [])) { if (typeof window.__gfRestoreLoop === 'function') window.__gfRestoreLoop(loop); } } catch (e) {}
+  try { if (window.__GF_CREATED_REACT_HOOK__) delete window.__REACT_DEVTOOLS_GLOBAL_HOOK__; delete window.__GF_CREATED_REACT_HOOK__; } catch (e) {}
+  try { delete window.__gfScan; delete window.__gfRefill; delete window.__gfRequestEnd; delete window.__gfRestoreLoop; delete window.__GF; } catch (e) {}
+  return {ok: true, unloaded: true};
 }
 """
 
@@ -504,6 +588,7 @@ JS_HP_DRAIN = r"""
           comp: gf.comp || '', hp: gf.hp,
           oneHit: !!gf.oneHit, oneHitWrapped: !!gf.oneHitWrapped,
           oneHitKills: gf.oneHitKills || 0,
+          endRequested: !!gf.endRequested, endApplied: !!gf.endApplied,
           scanInfo: gf.scanInfo, err: gf.err, events: ev};
 }
 """
@@ -629,7 +714,11 @@ JS_STATE = r"""
 
 JS_CLICK_CHALLENGE = r"""
 () => { const b = document.querySelector('[class*="challengeButton"]');
-  if (!b) return null; b.click(); return (b.innerText || '').replace(/\n/g, ' ').trim(); }
+  if (!b) return null;
+  const text = (b.innerText || '').replace(/\n/g, ' ').trim();
+  if (/(鱼翅|送出礼物|充值|付费|支付|礼物)/.test(text))
+    return {ok: false, why: 'paid-button-blocked', text: text.slice(0, 80)};
+  b.click(); return {ok: true, text: text}; }
 """
 
 JS_CLICK_SKILL = r"""
@@ -658,6 +747,7 @@ JS_CLICK_FINAL_START = r"""
   const isBtn = el => el.matches('button, [role="button"]');
   const clickable = el => isBtn(el)
       || /btn|Btn|footer|Footer|confirm|Confirm|start|Start/.test(String(el.className || ''));
+  const paid = el => /(鱼翅|送出礼物|充值|付费|支付|礼物)/.test(T(el));
 
   const list = document.querySelector('[class*="Starter-module_skillList"]');
   if (!list) return {ok: false, why: 'no-skillList'};
@@ -684,13 +774,14 @@ JS_CLICK_FINAL_START = r"""
 
   // 优先真实 <button>；容器元素只在找不到按钮时兜底，避免选中包装层而漏判 disabled
   const choose = arr => {
-    const real = arr.filter(isBtn);
+    const safe = arr.filter(x => !paid(x));
+    const real = safe.filter(isBtn);
     for (const re of KEY) { const b = real.find(x => re.test(T(x))); if (b) return {b: b, how: 'text'}; }
     const f = real.find(x => /footer/i.test(String(x.className || '')));
     if (f) return {b: f, how: 'footer'};
-    for (const re of KEY) { const b = arr.find(x => re.test(T(x))); if (b) return {b: b, how: 'text-wrapper'}; }
+    for (const re of KEY) { const b = safe.find(x => re.test(T(x))); if (b) return {b: b, how: 'text-wrapper'}; }
     if (real.length === 1) return {b: real[0], how: 'single'};
-    if (arr.length === 1) return {b: arr[0], how: 'single-wrapper'};
+    if (safe.length === 1) return {b: safe[0], how: 'single-wrapper'};
     return {b: null, how: null};
   };
 
@@ -700,7 +791,7 @@ JS_CLICK_FINAL_START = r"""
   const dump = arr => [...new Set(arr)].slice(0, 6).map(b =>
       b.tagName + '|' + T(b).slice(0, 16) + '|' + String(b.className || '').slice(0, 34));
 
-  if (!btn) return {ok: false, why: 'no-button', hops: hops,
+  if (!btn) return {ok: false, why: found.concat(all).some(paid) ? 'paid-button-blocked' : 'no-button', hops: hops,
                     panelCls: String((scope && scope.className) || '').slice(0, 90),
                     seen: dump(found.concat(all))};
   if (off(btn)) return {ok: false, why: 'disabled', how: how, text: T(btn).slice(0, 24),
@@ -811,7 +902,9 @@ def score_skill_text(txt):
 class GuardFishBot:
     def __init__(self, rid=DEFAULT_RID, rounds=10, gap_min=5, gap_max=15,
                  headless=False, claim_weekpass=True, on_log=None,
-                 hp_guard=True, hp_threshold=5, coin_play=True, one_hit=False):
+                 hp_guard=True, hp_threshold=5, coin_play=True, one_hit=False,
+                 max_battle_seconds=MAX_BATTLE_SECONDS, stop_stage=0,
+                 advance_stages=0):
         self.rid = str(rid)
         self.rounds = int(rounds)
         self.gap_min = float(gap_min or 0)
@@ -822,6 +915,9 @@ class GuardFishBot:
         self.hp_threshold = int(hp_threshold or 5)
         self.coin_play = bool(coin_play)          # 免费用尽后用银币续打（银币为免费获取）
         self.one_hit = bool(one_hit)              # 秒杀模式：我方卡牌造成的伤害直接击杀
+        self.max_battle_seconds = max(float(max_battle_seconds or MAX_BATTLE_SECONDS), 1.0)
+        self.stop_stage = max(int(stop_stage or 0), 0)       # 绝对关卡目标，0=关闭
+        self.advance_stages = max(int(advance_stages or 0), 0)  # 从起始关推进的关卡数，0=关闭
         self._one_hit_kills = 0
         self._battle_paid = "free"                # free / coin
 
@@ -831,6 +927,17 @@ class GuardFishBot:
         self._ctx = None
         self._page = None
         self._lock = threading.Lock()
+        self._control_lock = threading.Lock()
+        self._runtime_pending = True
+        self._runtime_script_loaded = False
+        self._runtime_applied = None
+        self._natural_end_requested = False
+        self._natural_end_sent = False
+        self._stop_after_battle = False
+        self._natural_end_reason = ""
+        self._battle_active = False
+        self._stage_target = None
+        self._stage_stop_announced = False
         self._sinks = []
         if on_log:
             self._sinks.append(on_log)
@@ -851,6 +958,26 @@ class GuardFishBot:
     # -------- 日志 --------
     def add_log_sink(self, fn):
         self._sinks.append(fn)
+
+    def set_runtime_controls(self, hp_guard=None, one_hit=None, hp_threshold=None):
+        """更新运行中的回血/秒杀开关；实际页面操作由机器人线程执行。"""
+        with self._control_lock:
+            if hp_guard is not None:
+                self.hp_guard = bool(hp_guard)
+            if one_hit is not None:
+                self.one_hit = bool(one_hit)
+            if hp_threshold is not None:
+                self.hp_threshold = max(int(hp_threshold), 1)
+            self._runtime_pending = True
+
+    def request_natural_end(self, reason="用户请求"):
+        """请求本场把基地降到 1 血，让游戏自己的失败/结算流程收尾。"""
+        with self._control_lock:
+            if not self._natural_end_requested:
+                self._natural_end_reason = str(reason)
+            self._natural_end_requested = True
+            self._stop_after_battle = True
+        self._log("已请求本场正常结束：%s（将基地降到 1 血，等待游戏结算）" % reason, "warn")
 
     def _log(self, msg, level="info"):
         line = "[%s] %s" % (time.strftime("%H:%M:%S"), msg)
@@ -890,11 +1017,6 @@ class GuardFishBot:
         self._page = ctx.pages[0] if ctx.pages else ctx.new_page()
         self._log("浏览器就绪：%s" % exe)
         try:
-            ctx.add_init_script(FAKE_DEVTOOLS_HOOK)
-            ctx.add_init_script(JS_HP_WATCH)
-        except Exception as e:
-            self._log("注入回血脚本失败：%s" % str(e)[:120], "warn")
-        try:
             self._page.add_init_script(JS_HOOK)
         except Exception as e:
             self._log("注入 hook 失败：%s" % str(e)[:120], "warn")
@@ -910,21 +1032,108 @@ class GuardFishBot:
         except Exception:
             pass
 
-    def _apply_hp_config(self):
-        """把回血/秒杀配置同步到页面"""
+    def _install_runtime_script(self):
+        """只在用户开启功能或请求自然结束时动态装载引擎修改脚本。"""
+        if self._page is None:
+            return False
+        if self._runtime_script_loaded:
+            return True
         try:
-            r = self._page.evaluate(JS_HP_CFG, {"hpGuard": self.hp_guard,
-                                                "threshold": self.hp_threshold,
-                                                "oneHit": self.one_hit})
-            if r:
-                self._log("回血守护：%s（阈值 < %s 回满）｜秒杀模式：%s"
-                          % ("开" if r.get("hpGuard") else "关", r.get("threshold"),
-                             "开" if r.get("oneHit") else "关"))
-            return r
-        except Exception:
+            self._page.evaluate(FAKE_DEVTOOLS_HOOK)
+            self._page.evaluate(JS_HP_WATCH)
+            self._runtime_script_loaded = True
+            self._runtime_applied = None
+            self._log("已动态加载回血/秒杀控制模块", "dim")
+            return True
+        except Exception as e:
+            self._log("动态加载回血/秒杀模块失败：%s" % str(e)[:120], "warn")
+            return False
+
+    def _unload_runtime_script(self):
+        if self._page is None or not self._runtime_script_loaded:
+            return
+        try:
+            self._page.evaluate(JS_HP_UNLOAD)
+        except Exception as e:
+            self._log("卸载回血/秒杀模块失败：%s" % str(e)[:120], "warn")
+        self._runtime_script_loaded = False
+        self._runtime_applied = None
+
+    def _apply_runtime_controls(self, force=False):
+        """在机器人线程内同步实时开关，避免从 GUI 线程调用 Playwright。"""
+        if self._page is None:
+            return None
+        with self._control_lock:
+            hp_guard = bool(self.hp_guard)
+            one_hit = bool(self.one_hit)
+            threshold = max(int(self.hp_threshold or 5), 1)
+            pending = bool(self._runtime_pending)
+            natural_end = bool(self._natural_end_requested)
+            natural_sent = bool(self._natural_end_sent)
+
+        if natural_end:
+            if not self._install_runtime_script():
+                return None
+            try:
+                self._page.evaluate(JS_HP_CFG, {
+                    "hpGuard": False, "oneHit": False, "threshold": threshold,
+                    "discover": True, "maxRefillMs": self.max_battle_seconds * 1000,
+                })
+                if not natural_sent:
+                    r = self._page.evaluate(JS_HP_END)
+                    if isinstance(r, dict) and (r.get("ok") or r.get("pending")):
+                        with self._control_lock:
+                            self._natural_end_sent = True
+                        if r.get("ok"):
+                            self._log("已将基地降到 1 血，等待游戏自然结算", "warn")
+                        else:
+                            self._log("已请求自然结束，等待识别战斗引擎", "warn")
+                        return r
+                    self._log("自然结束请求暂未生效：%s" % (r or "未知原因"), "warn")
+                    return r
+                return None
+            except Exception as e:
+                self._log("同步自然结束请求失败：%s" % str(e)[:120], "warn")
+                return None
+
+        active = hp_guard or one_hit
+        if active:
+            if not self._install_runtime_script():
+                return None
+            if pending or force or self._runtime_applied is None:
+                try:
+                    r = self._page.evaluate(JS_HP_CFG, {
+                        "hpGuard": hp_guard, "oneHit": one_hit, "threshold": threshold,
+                        "discover": False, "maxRefillMs": self.max_battle_seconds * 1000,
+                    })
+                    with self._control_lock:
+                        self._runtime_pending = False
+                    self._runtime_applied = (hp_guard, one_hit, threshold)
+                    self._log("回血守护：%s（阈值 < %s 回满）｜秒杀模式：%s"
+                              % ("开" if r and r.get("hpGuard") else "关", threshold,
+                                 "开" if r and r.get("oneHit") else "关"))
+                    return r
+                except Exception as e:
+                    self._log("同步回血/秒杀开关失败：%s" % str(e)[:120], "warn")
+                    return None
             return None
 
+        # 两个功能都关闭时，动态卸载脚本并恢复被包装的方法。
+        if self._runtime_script_loaded:
+            self._unload_runtime_script()
+        with self._control_lock:
+            self._runtime_pending = False
+        return None
+
+    def _apply_hp_config(self):
+        """兼容旧调用点：同步实时控制配置。"""
+        return self._apply_runtime_controls(force=True)
+
     def _close_browser(self):
+        try:
+            self._unload_runtime_script()
+        except Exception:
+            pass
         try:
             if self._ctx is not None:
                 self._ctx.close()
@@ -1091,6 +1300,8 @@ class GuardFishBot:
             if st2:
                 st = st2
         txt = st.get("challengeTxt") or ""
+        if any(k in txt for k in ("鱼翅", "送出礼物", "充值", "付费", "支付", "礼物")):
+            return False, "挑战按钮疑似付费入口（%s），为安全起见停止" % txt[:80]
         if "关" in txt:                      # 免费局（副标题 第N关）
             self._battle_paid = "free"
             return True, txt
@@ -1111,6 +1322,7 @@ class GuardFishBot:
         """尝试开启一场并进入战场（数据就绪等待 + 点击重试 + 面板处理）。
         返回 (ok, info)：info = {"skills": [...]}"""
         info = {"skills": []}
+        self._apply_runtime_controls()
         # a) 已在对局/面板中 → 直接进入
         st = self._state() or {}
         if st.get("inBattle") or st.get("skillPanel") or st.get("finalSkillList"):
@@ -1127,6 +1339,9 @@ class GuardFishBot:
             self._log(why + "。", "warn")
             return False, info
         r = self._click(JS_CLICK_CHALLENGE)
+        if isinstance(r, dict) and not r.get("ok"):
+            self._log("已拦截疑似付费挑战按钮：%s" % (r.get("text") or r.get("why") or "未知"), "warn")
+            return False, info
         self._log("已点击「开启挑战」（%s%s）"
                   % (why, "，本场消耗银币" if self._battle_paid == "coin" else ""))
         if not r:
@@ -1233,6 +1448,9 @@ class GuardFishBot:
 
     def _goto_game(self):
         self._log("打开游戏页：房间 %s" % self.rid)
+        # 页面导航会清掉动态引擎模块；下一步按当前开关决定是否重新装载。
+        self._runtime_script_loaded = False
+        self._runtime_applied = None
         try:
             self._page.goto(GAME_URL.format(rid=self.rid), wait_until="domcontentloaded", timeout=90000)
         except Exception as e:
@@ -1242,9 +1460,6 @@ class GuardFishBot:
             has = self._page.evaluate("() => !!window.__WM")
             if not has:
                 self._page.evaluate(JS_HOOK)
-            hasgf = self._page.evaluate("() => !!window.__GF")
-            if not hasgf:
-                self._page.evaluate(JS_HP_WATCH)
         except Exception:
             pass
         self._apply_hp_config()
@@ -1312,6 +1527,8 @@ class GuardFishBot:
             self._log("已在运行中", "warn")
             return
         self._stop.clear()
+        self._natural_end_sent = False
+        self._stop_after_battle = False
         self._thread = threading.Thread(target=self._run, name="guardfish-bot", daemon=True)
         self._thread.start()
 
@@ -1330,6 +1547,8 @@ class GuardFishBot:
                 if self.rounds > 0 and i > self.rounds:
                     break
                 if self._stop.is_set():
+                    break
+                if self._stop_after_battle:
                     break
                 self.status["round"] = i
                 r = self._one_battle(i)
@@ -1355,7 +1574,9 @@ class GuardFishBot:
                              ("结算：" + (r.get("resultText") or "")) if r.get("resultText") else ""))
                 if self._stop.is_set():
                     break
-                if i < self.rounds:
+                if self._stop_after_battle:
+                    break
+                if self.rounds <= 0 or i < self.rounds:
                     self._sleep_gap()
 
             self.status["state"] = "已结束" if not self._stop.is_set() else "已停止"
@@ -1365,6 +1586,7 @@ class GuardFishBot:
             self._log(traceback.format_exc()[-800:], "error")
             self.status["state"] = "异常"
         finally:
+            self._battle_active = False
             try:
                 self._close_browser()
             except Exception:
@@ -1386,9 +1608,21 @@ class GuardFishBot:
                 return
             time.sleep(0.5)
 
+    def _stage_target_for(self, stage0):
+        targets = []
+        if self.stop_stage > 0:
+            targets.append(self.stop_stage)
+        if self.advance_stages > 0 and stage0 is not None:
+            # “推进 N 关”表示在本场起始关基础上再推进 N 个关卡。
+            targets.append(int(stage0) + self.advance_stages)
+        return max(targets) if targets else None
+
     def _one_battle(self, idx):
         """打一场，返回统计 dict 或 None"""
         self.status["state"] = "准备开局"
+        self._stage_target = None
+        self._stage_stop_announced = False
+        self._one_hit_kills = 0
         with self._lock:
             self._battle_boxes = 0
         self._server_reject_ts = 0
@@ -1429,6 +1663,8 @@ class GuardFishBot:
             self._log("开局未成功，刷新页面后重试一次…", "warn")
             self._snap("pre_battle_retry")
             try:
+                self._runtime_script_loaded = False
+                self._runtime_applied = None
                 self._page.reload(wait_until="domcontentloaded", timeout=60000)
                 self._wait_ready(60)
                 self._apply_hp_config()
@@ -1443,6 +1679,7 @@ class GuardFishBot:
 
         # 3) 战斗循环
         self.status["state"] = "战斗中"
+        self._battle_active = True
         t_battle0 = time.time()
         ended = None
         result_text = ""
@@ -1456,13 +1693,30 @@ class GuardFishBot:
         hp_found_logged = False
         last_progress_ts = time.time()
         last_sig = None
+        end_started = None
         try:
             self._page.evaluate(JS_HP_DRAIN)      # 清掉上一场的残留事件
         except Exception:
             pass
-        while time.time() - t_battle0 < MAX_BATTLE_SECONDS:
+        while True:
             if self._stop.is_set():
                 return None
+            # 运行中的开关和自然结束请求都在机器人线程执行，GUI 点击会在这里生效。
+            elapsed = time.time() - t_battle0
+            with self._control_lock:
+                natural_requested = bool(self._natural_end_requested)
+            if end_started is None and not natural_requested and elapsed >= self.max_battle_seconds:
+                self.request_natural_end("达到单场监控时限 %.1f 分钟" % (self.max_battle_seconds / 60.0))
+                natural_requested = True
+            self._apply_runtime_controls()
+            if end_started is None and natural_requested:
+                end_started = time.time()
+                self._log("进入自然结束宽限期（最多 %d 秒）" % END_GRACE_SECONDS, "warn")
+            if end_started is not None and time.time() - end_started > END_GRACE_SECONDS:
+                ended = "超时未结算"
+                self._log("自然结束后 %d 秒仍未出现结算，停止继续开新场，避免同一对局被重复计场。" % END_GRACE_SECONDS,
+                          "error")
+                break
             time.sleep(TICK)
             st = self._state()
             if not st:
@@ -1472,6 +1726,21 @@ class GuardFishBot:
             stage = (wm.get("stage") or {})
             if stage0 is None and stage.get("curStage"):
                 stage0 = stage.get("curStage")
+                self._stage_target = self._stage_target_for(stage0)
+                if self._stage_target is not None:
+                    self._log("本场关卡结束目标：第 %s 关（绝对目标=%s，推进=%s）"
+                              % (self._stage_target, self.stop_stage or "关",
+                                 self.advance_stages or "关"))
+            cur_stage = stage.get("curStage")
+            try:
+                cur_stage_num = int(cur_stage) if cur_stage is not None else None
+            except (TypeError, ValueError):
+                cur_stage_num = None
+            if (self._stage_target is not None and cur_stage_num is not None
+                    and cur_stage_num >= int(self._stage_target)
+                    and not self._stage_stop_announced):
+                self._stage_stop_announced = True
+                self.request_natural_end("达到第%s关目标" % cur_stage_num)
 
             # 血条守护：回收事件（回血/掉血）
             try:
@@ -1600,8 +1869,8 @@ class GuardFishBot:
 
         dur = time.time() - t_battle0
         if ended is None:
-            ended = "超时保护"
-            self._log("达到单场最大等待时间（%d 分钟），继续下一场" % (MAX_BATTLE_SECONDS // 60), "warn")
+            ended = "超时未结算"
+            self._log("单场监控结束但未检测到结算，停止继续开新场。", "error")
 
         # 3.5 结束清理（可能还有弹窗）
         for _ in range(4):
@@ -1616,6 +1885,8 @@ class GuardFishBot:
         if ended == "停滞恢复":
             try:
                 self._log("刷新页面恢复…", "warn")
+                self._runtime_script_loaded = False
+                self._runtime_applied = None
                 self._page.reload(wait_until="domcontentloaded", timeout=60000)
                 self._wait_ready(60)
                 self._apply_hp_config()
@@ -1650,6 +1921,8 @@ class GuardFishBot:
         """主页面卡住时的恢复：刷新页面（仅在非战斗中调用）"""
         try:
             self._log("刷新页面恢复…", "warn")
+            self._runtime_script_loaded = False
+            self._runtime_applied = None
             self._page.reload(wait_until="domcontentloaded", timeout=60000)
             ok = self._wait_ready(60)
             try:
@@ -1765,6 +2038,12 @@ def main():
     ap.add_argument("--hp-threshold", type=int, default=5, help="回血阈值（血量低于该值回满，默认 5）")
     ap.add_argument("--no-coin", action="store_true", help="免费用尽后不用银币续打（默认会用，银币为免费获取）")
     ap.add_argument("--one-hit", action="store_true", help="秒杀模式：我方卡牌伤害直接击杀怪物")
+    ap.add_argument("--max-battle-minutes", type=float, default=MAX_BATTLE_SECONDS / 60,
+                    help="单场最长监控时间（分钟，默认 13）")
+    ap.add_argument("--stop-stage", type=int, default=0,
+                    help="达到指定绝对关卡后自然结束（0=关闭）")
+    ap.add_argument("--advance-stages", type=int, default=0,
+                    help="从本场起始关推进指定关卡数后自然结束（0=关闭）")
     args = ap.parse_args()
 
     if args.selftest:
@@ -1788,7 +2067,10 @@ def main():
                            gap_min=args.gap_min, gap_max=args.gap_max,
                            headless=args.headless, claim_weekpass=not args.no_claim,
                            hp_guard=not args.no_hp, hp_threshold=args.hp_threshold,
-                           coin_play=not args.no_coin, one_hit=args.one_hit)
+                           coin_play=not args.no_coin, one_hit=args.one_hit,
+                           max_battle_seconds=args.max_battle_minutes * 60,
+                           stop_stage=args.stop_stage,
+                           advance_stages=args.advance_stages)
         bot.add_log_sink(sink)
         bot._log("命令行挂机启动：房间=%s 场数=%d%s%s" % (args.rid, args.rounds,
                  " [headless]" if args.headless else "",
@@ -1810,6 +2092,9 @@ def main():
     print("  --one-hit        秒杀模式：我方卡牌伤害直接击杀怪物")
     print("  --no-hp          关闭血量低于阈值自动回满")
     print("  --no-coin        免费用尽后不用银币续打")
+    print("  --max-battle-minutes N  单场最长监控时间（分钟）")
+    print("  --stop-stage N   达到第 N 关后自然结束")
+    print("  --advance-stages N  从起始关推进 N 关后自然结束")
     print("  --selftest       环境自检")
     print("图形界面请运行「保卫鱼娘助手.exe」或 gui.py")
 
