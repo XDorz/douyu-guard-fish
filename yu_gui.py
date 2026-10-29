@@ -59,25 +59,31 @@ class App:
     def _build(self):
         top = ttk.Frame(self.root, padding=(10, 10, 10, 4))
         top.pack(fill="x")
+        header = ttk.Frame(top)
+        header.grid(row=0, column=0, sticky="w")
+        options = ttk.Frame(top)
+        options.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        actions = ttk.Frame(top)
+        actions.grid(row=1, column=0, sticky="w", pady=(8, 0))
 
-        ttk.Label(top, text="房间号", font=FONT).grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text="房间号", font=FONT).grid(row=0, column=0, sticky="w")
         self.rid = tk.StringVar(value=botmod.DEFAULT_RID)
-        ttk.Entry(top, textvariable=self.rid, width=10, font=FONT).grid(row=0, column=1, padx=(4, 14))
+        ttk.Entry(header, textvariable=self.rid, width=10, font=FONT).grid(row=0, column=1, padx=(4, 14))
 
-        ttk.Label(top, text="场数(0=不限)", font=FONT).grid(row=0, column=2, sticky="w")
+        ttk.Label(header, text="场数(0=不限)", font=FONT).grid(row=0, column=2, sticky="w")
         self.rounds = tk.StringVar(value="0")
-        ttk.Entry(top, textvariable=self.rounds, width=6, font=FONT).grid(row=0, column=3, padx=(4, 14))
+        ttk.Entry(header, textvariable=self.rounds, width=6, font=FONT).grid(row=0, column=3, padx=(4, 14))
 
-        ttk.Label(top, text="场间等待(秒)", font=FONT).grid(row=0, column=4, sticky="w")
+        ttk.Label(header, text="场间等待(秒)", font=FONT).grid(row=0, column=4, sticky="w")
         self.gap_min = tk.StringVar(value="5")
         self.gap_max = tk.StringVar(value="15")
-        ttk.Entry(top, textvariable=self.gap_min, width=5, font=FONT).grid(row=0, column=5, padx=(4, 2))
-        ttk.Label(top, text="~", font=FONT).grid(row=0, column=6)
-        ttk.Entry(top, textvariable=self.gap_max, width=5, font=FONT).grid(row=0, column=7, padx=(2, 14))
+        ttk.Entry(header, textvariable=self.gap_min, width=5, font=FONT).grid(row=0, column=5, padx=(4, 2))
+        ttk.Label(header, text="~", font=FONT).grid(row=0, column=6)
+        ttk.Entry(header, textvariable=self.gap_max, width=5, font=FONT).grid(row=0, column=7, padx=(2, 14))
 
         # 回血守护：血量低于阈值自动回满
-        hp_frame = ttk.Frame(top)
-        hp_frame.grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        hp_frame = ttk.Frame(options)
+        hp_frame.pack(side="left", padx=(0, 20))
         self.hp_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(hp_frame, text="血量低于", variable=self.hp_var,
                         command=self._runtime_options_changed).pack(side="left")
@@ -89,12 +95,12 @@ class App:
 
         # 银币续打：免费用尽后花银币继续（银币免费获取，不用鱼翅）
         self.coin_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(top, text="免费用尽后用银币续打（银币免费获得）",
-                        variable=self.coin_var).grid(row=1, column=4, columnspan=5, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(options, text="免费用尽后用银币续打（银币免费获得）",
+                        variable=self.coin_var).pack(side="left", padx=(0, 20))
 
         # 秒杀策略：默认保留原来的全额秒杀，也可切换成概率或攻击倍率。
-        one_hit_frame = ttk.Frame(top)
-        one_hit_frame.grid(row=1, column=9, columnspan=5, sticky="w", pady=(8, 0))
+        one_hit_frame = ttk.Frame(options)
+        one_hit_frame.pack(side="left")
         self.one_hit_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(one_hit_frame, text="秒杀",
                         variable=self.one_hit_var,
@@ -117,20 +123,23 @@ class App:
         self._update_one_hit_mode_ui()
 
         self.headless_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top, text="后台运行(隐藏浏览器)", variable=self.headless_var).grid(row=0, column=8, padx=(0, 14))
+        ttk.Checkbutton(header, text="后台运行(隐藏浏览器)", variable=self.headless_var).grid(row=0, column=8, padx=(0, 14))
 
-        self.start_btn = tk.Button(top, text="开始挂机", width=11, font=FONT_B,
+        self.start_btn = tk.Button(actions, text="开始挂机", width=11, font=FONT_B,
                                    bg="#43a047", fg="white", command=self.start)
-        self.start_btn.grid(row=0, column=9, padx=(0, 8))
-        self.stop_btn = tk.Button(top, text="终止并退出", width=10, font=FONT_B,
+        self.start_btn.pack(side="left", padx=(0, 8))
+        self.stop_btn = tk.Button(actions, text="终止并退出", width=10, font=FONT_B,
                                   state="disabled", command=self.stop)
-        self.stop_btn.grid(row=0, column=10, padx=(0, 14))
+        self.stop_btn.pack(side="left", padx=(0, 8))
 
-        self.end_btn = tk.Button(top, text="本场正常结束", width=12, font=FONT_B,
+        self.end_btn = tk.Button(actions, text="本场正常结束", width=12, font=FONT_B,
                                  state="disabled", command=self.end_current)
-        self.end_btn.grid(row=0, column=11, padx=(0, 8))
-        ttk.Button(top, text="登录斗鱼", width=10, command=self.login).grid(row=0, column=12, padx=(0, 6))
-        ttk.Button(top, text="打开数据目录", width=12, command=self.open_dir).grid(row=0, column=13)
+        self.end_btn.pack(side="left", padx=(0, 8))
+        self.pause_btn = tk.Button(actions, text="暂时停止", width=10, font=FONT_B,
+                                   state="disabled", command=self.pause_or_resume)
+        self.pause_btn.pack(side="left", padx=(0, 14))
+        ttk.Button(actions, text="登录斗鱼", width=10, command=self.login).pack(side="left", padx=(0, 6))
+        ttk.Button(actions, text="打开数据目录", width=12, command=self.open_dir).pack(side="left")
 
         # 关卡目标和单场监控时限。两个关卡目标同时设置时取较大的实际关卡数。
         # 每个配置使用一个紧凑的小组，避免 grid 跨列后产生过大的组内间距。
@@ -138,7 +147,7 @@ class App:
         self.advance_stages = tk.StringVar(value="0")
         self.max_minutes = tk.StringVar(value="13")
         target_row = ttk.Frame(top)
-        target_row.grid(row=2, column=0, columnspan=14, sticky="w", pady=(8, 0))
+        target_row.grid(row=3, column=0, sticky="w", pady=(8, 0))
 
         def target_group(title, variable, suffix):
             group = ttk.Frame(target_row)
@@ -151,11 +160,12 @@ class App:
         target_group("推进", self.advance_stages, "关后结束（0=关）")
         target_group("单场最长", self.max_minutes, "分钟")
 
-        tips = ttk.Label(top, text="每日免费挑战 10 次；免费用尽后若银币 ≥10 会自动用银币续打（银币为免费获取；"
-                                   "绝技/加速等需鱼翅付费的功能一律不会点击）。"
-                                   "‘本场正常结束’会把基地降到 1 血并等待游戏结算；‘终止并退出’会作废当前场。",
-                         font=FONT_S, foreground="#666")
-        tips.grid(row=3, column=0, columnspan=14, sticky="w", pady=(8, 0))
+        tips = ttk.Label(top, text="‘本场正常结束’：1 血、随机 1–100 伤害收尾，随后继续下一场。"
+                                   "‘暂时停止’：收尾回主界面，保留计数等待恢复。‘终止并退出’：关闭浏览器。\n"
+                                   "免费用尽后可用银币续打；绝技、加速等鱼翅付费按钮不会自动点击。",
+                         font=FONT_S, foreground="#666", wraplength=1000)
+        tips.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        top.bind("<Configure>", lambda e: tips.configure(wraplength=max(300, e.width - 20)))
 
         self.status = tk.StringVar(value="状态：未运行")
         ttk.Label(self.root, textvariable=self.status, anchor="w", padding=(10, 5),
@@ -261,22 +271,29 @@ class App:
                 m3 = re.search(r"战报：起始第(\S+)关 → 到达第(\S+)关，用时 (\d+) 秒", line)
                 if m3:
                     self._hud = "上场：第%s→%s关，用时%ss" % (m3.group(1), m3.group(2), m3.group(3))
-                if self.running:
-                    b = self.bot
-                    st = b.status if b else {}
-                    self.status.set("运行中 · 第 %s 场｜%s｜状态 %s｜回血 %s 次｜银币 %s｜天梯排名 %s"
-                                    % (st.get("round", "-"), getattr(self, "_hud", "启动中"),
-                                       st.get("state", "-"), st.get("refills", 0),
-                                       st.get("coin", "-"), st.get("weekRank", "-")))
         except queue.Empty:
             pass
         except Exception:
             pass
-        if hasattr(self, "end_btn"):
-            active = bool(self.running and self.bot and self.bot._battle_active
-                          and not self.bot._natural_end_requested)
-            self.end_btn.config(state="normal" if active else "disabled")
+        self._refresh_run_state()
         self.root.after(150, self._pump)
+
+    def _refresh_run_state(self):
+        b = self.bot if self.running else None
+        active = bool(b and not b._stop.is_set())
+        self.end_btn.config(state="normal" if active and b._battle_active
+                            and not b._natural_end_requested and not b._paused else "disabled")
+        paused = bool(b and b._paused)
+        pending = bool(b and b._pause_requested and not paused)
+        self.pause_btn.config(text="恢复战斗" if paused else ("正在收尾…" if pending else "暂时停止"),
+                              state="normal" if active and not pending else "disabled")
+        if b:
+            st = b.status
+            self.status.set("%s · 已完成 %s/%s 场｜当前第 %s 场｜%s｜回血 %s 次｜银币 %s"
+                            % ("正在收尾后暂停" if pending else st.get("state", "运行中"),
+                               st.get("rounds_done", 0), b.rounds if b.rounds > 0 else "不限",
+                               st.get("round", "-"), getattr(self, "_hud", "启动中"),
+                               st.get("refills", 0), st.get("coin", "-")))
 
     # ---------- 控制 ----------
     def _one_hit_mode_key(self):
@@ -390,6 +407,7 @@ class App:
             self.gap_max.set("%g" % gap_max)
 
         self._save_config()
+        self.bot = None
         self.running = True
         self._desired_hp_guard = bool(self.hp_var.get())
         self._desired_one_hit = bool(self.one_hit_var.get())
@@ -436,7 +454,7 @@ class App:
                                            one_hit_mode=one_hit_mode,
                                            one_hit_probability=one_hit_probability,
                                            attack_multiplier=attack_multiplier,
-                                           debug=self.debug)
+                                           debug=self.debug, pause_on_timeout=True)
             # 如果用户在工作线程刚启动的瞬间点击了复选框，以当前 GUI 值为准。
             self.bot.set_runtime_controls(hp_guard=self._desired_hp_guard,
                                           one_hit=self._desired_one_hit,
@@ -456,6 +474,7 @@ class App:
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
         self.end_btn.config(state="disabled")
+        self.pause_btn.config(state="disabled", text="暂时停止")
         self.status.set("状态：已停止")
         self._log("[系统] 已停止")
 
@@ -487,6 +506,15 @@ class App:
             self.bot.request_natural_end("GUI 点击")
             self.end_btn.config(state="disabled")
             self._log("[系统] 已请求本场正常结束，等待游戏结算…", "warn")
+
+    def pause_or_resume(self):
+        if not (self.running and self.bot):
+            return
+        if self.bot._paused:
+            self.bot.request_resume()
+        else:
+            self.bot.request_pause()
+        self._refresh_run_state()
 
     def stop(self):
         if self.bot:

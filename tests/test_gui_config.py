@@ -4,10 +4,45 @@ import unittest
 from unittest.mock import patch
 
 from yu_gui import App, tk
+from bot import GuardFishBot
 import settings
 
 
 class GuiConfigTests(unittest.TestCase):
+    def test_pause_button_changes_to_resume_and_keeps_bot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch('yu_gui.botmod.CONFIG_PATH', os.path.join(directory, 'config.json')), \
+                    patch('yu_gui.botmod.chrome_candidates', return_value=[]):
+                try:
+                    root = tk.Tk()
+                except tk.TclError as exc:
+                    self.skipTest('GUI requires a display: %s' % exc)
+                root.withdraw()
+                app = App(root)
+                b = GuardFishBot(rounds=9)
+                b._log = lambda *args: None
+                app.bot, app.running = b, True
+                try:
+                    app._refresh_run_state()
+                    app.pause_btn.invoke()
+                    self.assertTrue(b._pause_requested)
+                    self.assertEqual(str(app.pause_btn['state']), 'disabled')
+                    b.rounds_done = 1
+                    b.status.update(rounds_done=1, round=1, state='已暂停')
+                    b._paused = True
+                    app._refresh_run_state()
+                    self.assertEqual(app.pause_btn['text'], '恢复战斗')
+                    self.assertIn('已完成 1/9', app.status.get())
+                    app.pause_btn.invoke()
+                    self.assertFalse(b._pause_requested)
+                    self.assertTrue(b._pause_wakeup.is_set())
+                    self.assertIs(app.bot, b)
+                    self.assertEqual(b.rounds_done, 1)
+                finally:
+                    root.update_idletasks()
+                    app.running = False
+                    app.on_close()
+
     def test_reopen_restores_configuration_for_normal_and_debug_build(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "config.json")

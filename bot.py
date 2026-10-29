@@ -38,7 +38,7 @@ DEFAULT_RID = "12306"
 GAME_URL = "https://www.douyu.com/pages/vibe-lab-act202606-game/mine?rid={rid}&isAnchorSide=0"
 HOME_URL = "https://www.douyu.com/"
 
-MAX_BATTLE_SECONDS = 13 * 60      # 单场最长等待（服务端上限 600s + 余量）
+MAX_BATTLE_SECONDS = 13 * 60      # 默认单场监控时限，GUI / CLI 可调整
 END_GRACE_SECONDS = 3 * 60         # 请求自然结束后等待结算的宽限时间（场上可能暂时没有接近基地的敌人）
 TICK = 0.5                         # 状态轮询间隔
 IDLE_STUCK_LIMIT = 90              # 空闲态卡住多久后尝试恢复（刷新页面）
@@ -315,7 +315,7 @@ JS_HP_WATCH = r"""
                             battleT0: 0, maxRefillMs: 540000, capped: false,
                             oneHit: false, oneHitMode: 'full', oneHitProbability: 50,
                             attackMultiplier: 2, oneHitKills: 0, oneHitWrapped: false,
-                            discover: false, endRequested: false, endApplied: false,
+                            discover: false, endRequested: false, endApplied: false, finishing: false, endLoop: null,
                             intervalId: null, wrappedLoops: [],
                             scanCount: 0, scanInfo: null, diag: null, err: null, comp: ''};
   // 解析：ref.current 可能是 BattleLoop（直接含 coreHp）或 BattleManager（显示层，coreHp 在 .loop 里）
@@ -416,23 +416,62 @@ JS_HP_WATCH = r"""
     } catch (e) {}
   }
   window.__gfRestoreLoop = restoreLoop;
+  // 只包装伤害入口；落点、击杀、掉落和结算仍由原引擎处理。
+  function wrapDamage(loop) {
+    if (loop.__gfOneHitWrapped) return;
+    const original = loop._dealDamage;
+    if (typeof original !== 'function') return;
+    const hadOwn = Object.prototype.hasOwnProperty.call(loop, '_dealDamage');
+    loop._dealDamage = function (enemy, damage, cardId, isCrit) {
+      let nextDamage = damage;
+      try {
+        // 收尾优先级最高，覆盖普通攻击、暴击、传导、风系横扫和已发射的弹丸。
+        if (GF.finishing) {
+          nextDamage = 1 + Math.floor(Math.random() * 100);
+        } else if (GF.oneHit && enemy && typeof enemy.currentHp === 'number' && enemy.currentHp > 0) {
+          const mode = GF.oneHitMode || 'full';
+          if (mode === 'multiplier') {
+            const mult = Math.max(0.01, Number(GF.attackMultiplier) || 1);
+            nextDamage = Math.max(1, Math.floor((Number(damage) || 0) * mult));
+            if (nextDamage >= enemy.currentHp) GF.oneHitKills++;
+          } else if (mode === 'full' || (mode === 'probability' &&
+              Math.random() < Math.max(0, Math.min(100, Number(GF.oneHitProbability) || 0)) / 100)) {
+            GF.oneHitKills++;
+            nextDamage = enemy.currentHp;
+          }
+        }
+      } catch (e) { GF.err = String(e); }
+      // 原方法只调用一次，避免原引擎抛错时重复造成伤害。
+      return original.call(this, enemy, nextDamage, cardId, isCrit);
+    };
+    loop.__gfDealHadOwn = hadOwn;
+    loop.__gfDealOriginal = original;
+    loop.__gfOneHitWrapped = true; GF.oneHitWrapped = true;
+    if (GF.wrappedLoops.indexOf(loop) < 0) GF.wrappedLoops.push(loop);
+  }
   function forceEnd(loop, tag) {
     try {
-      if (!loop || typeof loop.coreHp !== 'number' || loop.running === false) return false;
+      if (!loop || typeof loop.coreHp !== 'number' || loop.running === false || loop.coreHp <= 0) return false;
       GF.hpGuard = false;
       GF.oneHit = false;
+      GF.finishing = true;
+      wrapDamage(loop);
       const before = loop.coreHp;
       loop.coreHp = 1;
       if (loop.callbacks && typeof loop.callbacks.onCoreHpChanged === 'function')
-        loop.callbacks.onCoreHpChanged(1, 1);
+        loop.callbacks.onCoreHpChanged(1, loop.config.battle.baseCoreHp || 20);
       GF.endRequested = false;
       GF.endApplied = true;
-      GF.enabled = false;
+      GF.endLoop = loop;
+      GF.enabled = true;
       GF.hpEvents.push({t: Date.now(), type: 'end', from: before, to: 1, tag: tag || 'request'});
       return true;
     } catch (e) { GF.err = String(e); return false; }
   }
   window.__gfRequestEnd = () => {
+    GF.hpGuard = false;
+    GF.oneHit = false;
+    GF.finishing = true;
     GF.endRequested = true;
     GF.discover = true;
     GF.enabled = true;
@@ -444,10 +483,10 @@ JS_HP_WATCH = r"""
   };
   function refill(loop, tag) {
     try {
-      if (!GF.hpGuard) return;
+      if (!GF.hpGuard || GF.finishing || GF.endRequested) return;
       if (!loop || typeof loop.coreHp !== 'number') return;
       if (loop.running === false) return;
-      // 回血时间上限：单场接近服务端 600 秒上限时主动停手，让战斗自然结束
+      // 回血时间上限：按用户设置的单场时限停手，让战斗自然结束
       if (GF.battleT0 && (Date.now() - GF.battleT0) > GF.maxRefillMs) {
         if (!GF.capped) {
           GF.capped = true;
@@ -487,7 +526,8 @@ JS_HP_WATCH = r"""
       if (!t || typeof t.loop.coreHp !== 'number') return;
       const loop = t.loop;
       GF.loopRef = loop;
-      if (GF.endRequested && forceEnd(loop, 'watch')) return;
+      if (GF.endRequested || (GF.finishing && (GF.endLoop !== loop || loop.coreHp > 1)))
+        forceEnd(loop, 'watch');
       if (!GF.battleT0) { GF.battleT0 = Date.now(); GF.capped = false; }
       if (GF.hpGuard && !loop.__gfWrapped) {
         try {
@@ -510,44 +550,7 @@ JS_HP_WATCH = r"""
           }
         } catch (e) { GF.err = String(e); }
       }
-      // 秒杀策略：保留原 _dealDamage → _killEnemy → 掉落/清关链路，只调整传入伤害。
-      if (GF.oneHit && !loop.__gfOneHitWrapped) {
-        try {
-          const proto2 = Object.getPrototypeOf(loop);
-          const orig2 = loop._dealDamage || (proto2 && proto2._dealDamage);
-          if (typeof orig2 === 'function') {
-            const hadOwn2 = Object.prototype.hasOwnProperty.call(loop, '_dealDamage');
-            const original2 = loop._dealDamage;
-            loop._dealDamage = function (enemy, damage, cardId, isCrit) {
-              try {
-                if (GF.oneHit && enemy && typeof enemy.currentHp === 'number' && enemy.currentHp > 0) {
-                  const mode = GF.oneHitMode || 'full';
-                  let hit = mode === 'full';
-                  let nextDamage = damage;
-                  if (mode === 'probability') {
-                    hit = Math.random() < Math.max(0, Math.min(100, Number(GF.oneHitProbability) || 0)) / 100;
-                  } else if (mode === 'multiplier') {
-                    const mult = Math.max(0.01, Number(GF.attackMultiplier) || 1);
-                    nextDamage = Math.max(1, Math.floor((Number(damage) || 0) * mult));
-                    if (nextDamage >= enemy.currentHp) GF.oneHitKills++;
-                    return orig2.call(this, enemy, nextDamage, cardId, isCrit);
-                  }
-                  if (hit) {
-                    GF.oneHitKills++;
-                    if (mode === 'full' || mode === 'probability') nextDamage = enemy.currentHp;
-                    return orig2.call(this, enemy, nextDamage, cardId, isCrit);
-                  }
-                }
-              } catch (e) { GF.err = String(e); }
-              return orig2.call(this, enemy, damage, cardId, isCrit);
-            };
-            loop.__gfDealHadOwn = hadOwn2;
-            loop.__gfDealOriginal = original2;
-            loop.__gfOneHitWrapped = true; GF.oneHitWrapped = true;
-            if (GF.wrappedLoops.indexOf(loop) < 0) GF.wrappedLoops.push(loop);
-          }
-        } catch (e) { GF.err = String(e); }
-      }
+      if (GF.oneHit || GF.finishing) wrapDamage(loop);
       const hp = loop.coreHp;
       const stageMax2 = (loop.config && loop.config.battle && loop.config.battle.baseCoreHp) || 20;
       if (stageMax2 > (GF.fullHp || 0)) GF.fullHp = stageMax2;
@@ -580,7 +583,7 @@ JS_HP_CFG = r"""
   if (cfg && cfg.discover !== undefined) window.__GF.discover = !!cfg.discover;
   if (cfg && cfg.maxRefillMs !== undefined) window.__GF.maxRefillMs = Math.max(0, Number(cfg.maxRefillMs) || 0);
   // 守护循环（250ms）只要功能开启、正在寻找引擎或等待结束就运行
-  window.__GF.enabled = !!(window.__GF.hpGuard || window.__GF.oneHit || window.__GF.discover || window.__GF.endRequested);
+  window.__GF.enabled = !!(window.__GF.hpGuard || window.__GF.oneHit || window.__GF.discover || window.__GF.endRequested || window.__GF.finishing);
   return {hpGuard: window.__GF.hpGuard, enabled: window.__GF.enabled,
           threshold: window.__GF.threshold, oneHit: window.__GF.oneHit,
           oneHitMode: window.__GF.oneHitMode,
@@ -602,7 +605,7 @@ JS_HP_UNLOAD = r"""
 () => {
   const gf = window.__GF;
   if (!gf) return {ok: true, unloaded: false};
-  try { gf.enabled = false; gf.endRequested = false; } catch (e) {}
+  try { gf.enabled = false; gf.endRequested = false; gf.finishing = false; } catch (e) {}
   try { if (gf.intervalId) clearInterval(gf.intervalId); } catch (e) {}
   try { for (const loop of (gf.wrappedLoops || [])) { if (typeof window.__gfRestoreLoop === 'function') window.__gfRestoreLoop(loop); } } catch (e) {}
   try { if (window.__GF_CREATED_REACT_HOOK__) delete window.__REACT_DEVTOOLS_GLOBAL_HOOK__; delete window.__GF_CREATED_REACT_HOOK__; } catch (e) {}
@@ -616,6 +619,9 @@ JS_HP_DRAIN = r"""
   const gf = window.__GF;
   if (!gf) return null;
   const ev = gf.hpEvents ? gf.hpEvents.splice(0, 200) : [];
+  const loop = gf.loopRef;
+  const progress = loop ? [loop.currentFloor, loop.currentWave, loop.enemyInstanceCounter,
+                          loop.enemies && loop.enemies.length, loop.pendingSpawnQueue && loop.pendingSpawnQueue.length] : null;
   return {refills: gf.refills || 0, wrapped: !!gf.wrapped, found: !!gf.mgrRef,
           comp: gf.comp || '', hp: gf.hp,
           hpGuard: !!gf.hpGuard, enabled: !!gf.enabled, discover: !!gf.discover,
@@ -625,6 +631,7 @@ JS_HP_DRAIN = r"""
           oneHitWrapped: !!gf.oneHitWrapped,
           oneHitKills: gf.oneHitKills || 0,
           endRequested: !!gf.endRequested, endApplied: !!gf.endApplied,
+          finishing: !!gf.finishing, progress,
           scanInfo: gf.scanInfo, err: gf.err, events: ev};
 }
 """
@@ -958,7 +965,8 @@ class GuardFishBot:
                  hp_guard=True, hp_threshold=5, coin_play=True, one_hit=False,
                  max_battle_seconds=MAX_BATTLE_SECONDS, stop_stage=0,
                  advance_stages=0, one_hit_mode="full",
-                 one_hit_probability=50.0, attack_multiplier=2.0, debug=False):
+                 one_hit_probability=50.0, attack_multiplier=2.0, debug=False,
+                 pause_on_timeout=False):
         self.rid = str(rid)
         self.rounds = int(rounds)
         self.gap_min = float(gap_min or 0)
@@ -976,6 +984,7 @@ class GuardFishBot:
         self.stop_stage = max(int(stop_stage or 0), 0)       # 绝对关卡目标，0=关闭
         self.advance_stages = max(int(advance_stages or 0), 0)  # 从起始关推进的关卡数，0=关闭
         self.debug = bool(debug)
+        self.pause_on_timeout = bool(pause_on_timeout)
         self._debug_recorder = None
         self._debug_failed = False
         self._debug_last_capture = None
@@ -985,6 +994,7 @@ class GuardFishBot:
         self._stage_timer = None
         self._stage_fp = None
         self._one_hit_kills = 0
+        self._last_runtime_kills = 0
         self._battle_paid = "free"                # free / coin
 
         self._stop = threading.Event()
@@ -999,9 +1009,12 @@ class GuardFishBot:
         self._runtime_applied = None
         self._natural_end_requested = False
         self._natural_end_sent = False
-        self._stop_after_battle = False
         self._natural_end_reason = ""
         self._battle_active = False
+        self._pause_requested = False
+        self._paused = False
+        self._pause_wakeup = threading.Event()
+        self.rounds_done = 0
         self._stage_target = None
         self._stage_stop_announced = False
         self._sinks = []
@@ -1017,7 +1030,7 @@ class GuardFishBot:
 
         # 对外可见的状态（GUI 读取）
         self.status = {
-            "state": "空闲", "round": 0, "rounds": self.rounds, "stage": 0, "hp": 0,
+            "state": "空闲", "round": 0, "rounds": self.rounds, "rounds_done": 0, "stage": 0, "hp": 0,
             "freeNum": None, "maxStage": 0, "weekRank": 0, "nick": "", "coin": None,
         }
 
@@ -1046,6 +1059,8 @@ class GuardFishBot:
 
     def _reset_battle_controls(self):
         """开始新场前清除上一场的自然结束状态，并强制重新同步页面开关。"""
+        # 解除上一场的低伤害包装；新场按用户选择重新加载，避免收尾状态泄漏。
+        self._unload_runtime_script()
         with self._control_lock:
             self._natural_end_requested = False
             self._natural_end_sent = False
@@ -1056,10 +1071,61 @@ class GuardFishBot:
     def request_natural_end(self, reason="用户请求"):
         """请求本场把基地降到 1 血，让游戏自己的失败/结算流程收尾。"""
         with self._control_lock:
-            if not self._natural_end_requested:
-                self._natural_end_reason = str(reason)
+            if self._natural_end_requested:
+                return
+            self._natural_end_reason = str(reason)
             self._natural_end_requested = True
-        self._log("已请求本场正常结束：%s（将基地降到 1 血，等待游戏结算）" % reason, "warn")
+        self._log("已请求本场正常结束：%s（基地降到 1 血，每次伤害改为随机 1–100，等待游戏结算）" % reason, "warn")
+
+    def request_pause(self):
+        """GUI 只提交请求，当前场的收尾和暂停都在工作线程执行。"""
+        with self._control_lock:
+            if self._stop.is_set() or self._pause_requested or self._paused:
+                return False
+            self._pause_requested = True
+        self._log("已请求暂时停止：本场结算并回到主界面后暂停，保留场次和浏览器。", "warn")
+        return True
+
+    def request_resume(self):
+        with self._control_lock:
+            if self._stop.is_set() or not self._paused or not self._pause_requested:
+                return False
+            self._pause_requested = False
+            self._pause_wakeup.set()
+        return True
+
+    def _wait_if_paused(self, unfinished=False):
+        """保留调用栈和计数等待恢复；等待期间不查询页面、不执行游戏操作。"""
+        with self._control_lock:
+            requested = self._pause_requested
+        if not requested or self._stop.is_set():
+            return not self._stop.is_set()
+        self._unload_runtime_script()
+        with self._control_lock:
+            self._pause_wakeup.clear()
+            self._paused = True
+        self.status["state"] = "已暂停（本场未结算）" if unfinished else "已暂停"
+        self._debug_write("paused", unfinished=unfinished, rounds_done=self.rounds_done)
+        self._log("%s，已完成 %d%s 场；点击「恢复战斗」继续。" %
+                  (self.status["state"], self.rounds_done,
+                   "/%d" % self.rounds if self.rounds > 0 else ""))
+        while not self._stop.is_set():
+            with self._control_lock:
+                if not self._pause_requested:
+                    break
+            self._pause_wakeup.wait(0.5)
+        with self._control_lock:
+            self._paused = False
+            self._runtime_pending = True
+            # 暂停前卸载了页面模块。若本场未结束，恢复后要重新应用收尾请求。
+            self._natural_end_sent = False
+        if self._stop.is_set():
+            return False
+        self.status["state"] = "恢复监控" if unfinished else "准备开局"
+        self._debug_write("resumed", unfinished=unfinished, rounds_done=self.rounds_done)
+        self._log("已恢复挂机，继续%s（已完成 %d 场）。" %
+                  ("当前场监控" if unfinished else "后续场次", self.rounds_done))
+        return True
 
     def _log(self, msg, level="info"):
         line = "[%s] %s" % (time.strftime("%H:%M:%S"), msg)
@@ -1073,6 +1139,7 @@ class GuardFishBot:
     # -------- 停止 --------
     def request_stop(self):
         self._stop.set()
+        self._pause_wakeup.set()
         self._log("收到停止指令…", "warn")
 
     def stop(self):
@@ -1124,6 +1191,7 @@ class GuardFishBot:
             self._page.evaluate(FAKE_DEVTOOLS_HOOK)
             self._page.evaluate(JS_HP_WATCH)
             self._runtime_script_loaded = True
+            self._last_runtime_kills = 0
             self._runtime_applied = None
             self._log("已动态加载回血/秒杀控制模块", "dim")
             return True
@@ -1140,6 +1208,7 @@ class GuardFishBot:
             self._log("卸载回血/秒杀模块失败：%s" % str(e)[:120], "warn")
         self._runtime_script_loaded = False
         self._runtime_applied = None
+        self._last_runtime_kills = 0
 
     def _apply_runtime_controls(self, force=False):
         """在机器人线程内同步实时开关，避免从 GUI 线程调用 Playwright。"""
@@ -1173,7 +1242,7 @@ class GuardFishBot:
                         with self._control_lock:
                             self._natural_end_sent = True
                         if r.get("ok"):
-                            self._log("已将基地降到 1 血，等待游戏自然结算", "warn")
+                            self._log("已将基地降到 1 血，关闭回血和伤害强化，每次伤害随机 1–100，等待自然结算", "warn")
                         else:
                             self._log("已请求自然结束，等待识别战斗引擎", "warn")
                         return r
@@ -1188,7 +1257,8 @@ class GuardFishBot:
         if active:
             if not self._install_runtime_script():
                 return None
-            if pending or force or self._runtime_applied is None:
+            desired = (hp_guard, one_hit, threshold, one_hit_mode, one_hit_probability, attack_multiplier)
+            if pending or force or self._runtime_applied != desired:
                 try:
                     r = self._page.evaluate(JS_HP_CFG, {
                         "hpGuard": hp_guard, "oneHit": one_hit, "threshold": threshold,
@@ -1199,8 +1269,7 @@ class GuardFishBot:
                     })
                     with self._control_lock:
                         self._runtime_pending = False
-                    self._runtime_applied = (hp_guard, one_hit, threshold, one_hit_mode,
-                                             one_hit_probability, attack_multiplier)
+                    self._runtime_applied = desired
                     self._log("回血守护：%s（阈值 < %s 回满）｜秒杀模式：%s"
                               % ("开" if r and r.get("hpGuard") else "关", threshold,
                                  (one_hit_mode_text(one_hit_mode, one_hit_probability,
@@ -1356,7 +1425,7 @@ class GuardFishBot:
                                 self._log("服务端对局限制：%s 返回 %s（%s）"
                                           % (api, err, str(j.get("msg") or "")[:60]), "warn")
                             self._server_reject_ts = time.time()
-                    # 对局事件上报连续失败（≥3 次）也视为战斗被服务端中断
+                    # 连续上报失败只触发收尾，不代表已经结算。
                     if api == "game/stageEventReport":
                         err2 = j.get("error") if isinstance(j, dict) else None
                         try:
@@ -1366,7 +1435,7 @@ class GuardFishBot:
                         if err2:
                             self._report_errs += 1
                             if self._report_errs >= 3 and not self._server_reject_ts:
-                                self._log("对局上报连续失败（%s），判定战斗已被服务端中断" % err2, "warn")
+                                self._log("对局上报连续失败（%s），将尝试正常收尾并等待实际结算" % err2, "warn")
                                 self._server_reject_ts = time.time()
                         else:
                             self._report_errs = 0
@@ -1498,12 +1567,18 @@ class GuardFishBot:
         """尝试开启一场并进入战场（数据就绪等待 + 点击重试 + 面板处理）。
         返回 (ok, info)：info = {"skills": [...]}"""
         info = {"skills": []}
-        self._apply_runtime_controls()
         # a) 已在对局/面板中 → 直接进入
         st = self._state() or {}
         if st.get("inBattle") or st.get("skillPanel") or st.get("finalSkillList"):
+            self._apply_runtime_controls()
             self._log("检测到战斗进行中，继续监控")
             return True, info
+        if self._pause_requested and self._is_lobby(st):
+            if not self._wait_if_paused():
+                return False, info
+            # 暂停期间用户可能手动开始了战斗，恢复时重新识别。
+            return self._try_start_battle()
+        self._apply_runtime_controls()
 
         # b) 门闸（内部会等待页面数据就绪）
         if not st.get("canChallenge"):
@@ -1514,6 +1589,12 @@ class GuardFishBot:
         if not ok:
             self._log(why + "。", "warn")
             return False, info
+        if self._pause_requested:
+            if not self._wait_if_paused():
+                return False, info
+            return self._try_start_battle()
+        if self._stop.is_set():
+            return False, info
         r = self._click(JS_CLICK_CHALLENGE)
         if isinstance(r, dict) and not r.get("ok"):
             self._log("已拦截疑似付费挑战按钮：%s" % (r.get("text") or r.get("why") or "未知"), "warn")
@@ -1522,7 +1603,7 @@ class GuardFishBot:
                   % (why, "，本场消耗银币" if self._battle_paid == "coin" else ""))
         if not r:
             return False, info
-        # 标记本场开始时间（回血守护据此在 9 分钟时收手，避免撞服务端 600 秒上限）
+        # 标记本场开始时间，回血守护按用户设置的单场时限收手。
         try:
             self._page.evaluate("() => { if (window.__GF) { window.__GF.battleT0 = Date.now(); window.__GF.capped = false; window.__GF.oneHitKills = 0; } }")
         except Exception:
@@ -1613,6 +1694,10 @@ class GuardFishBot:
 
             # 仍停在主页面：点击可能落空（按钮未就绪/被拦截）→ 重试
             if st.get("canChallenge") and (time.time() - last_click) > 15 and clicks < 6:
+                if self._pause_requested and self._is_lobby(st):
+                    if not self._wait_if_paused():
+                        return False, info
+                    return self._try_start_battle()
                 r2 = self._click(JS_CLICK_CHALLENGE)
                 if r2:
                     clicks += 1
@@ -1709,7 +1794,10 @@ class GuardFishBot:
             self._natural_end_reason = ""
             self._runtime_pending = True
             self._runtime_applied = None
-            self._stop_after_battle = False
+            self._pause_requested = False
+            self._paused = False
+        self.rounds_done = 0
+        self.status["rounds_done"] = 0
         self._thread = threading.Thread(target=self._run, name="guardfish-bot", daemon=True)
         self._thread.start()
 
@@ -1726,22 +1814,22 @@ class GuardFishBot:
                 self.status["state"] = "未登录"
                 return
 
-            rounds_done = 0
-            i = 0
             while True:
-                i += 1
+                if self._pause_requested and self._is_lobby(self._state() or {}):
+                    if not self._wait_if_paused():
+                        break
+                i = self.rounds_done + 1
                 if self.rounds > 0 and i > self.rounds:
                     break
                 if self._stop.is_set():
-                    break
-                if self._stop_after_battle:
                     break
                 self.status["round"] = i
                 r = self._one_battle(i)
                 if r is None:
                     self._log("第%d场未能完成，停止。" % i, "error")
                     break
-                rounds_done += 1
+                self.rounds_done += 1
+                self.status["rounds_done"] = self.rounds_done
                 self._battle_write({
                     "date": self._date, "round": i,
                     "paid": r.get("paid"),
@@ -1761,13 +1849,11 @@ class GuardFishBot:
                              ("结算：" + (r.get("resultText") or "")) if r.get("resultText") else ""))
                 if self._stop.is_set():
                     break
-                if self._stop_after_battle:
-                    break
                 if self.rounds <= 0 or i < self.rounds:
                     self._sleep_gap()
 
             self.status["state"] = "已结束" if not self._stop.is_set() else "已停止"
-            self._log("运行结束（完成 %d 场）" % rounds_done)
+            self._log("运行结束（完成 %d 场）" % self.rounds_done)
         except Exception as e:
             self._log("异常终止：%s" % str(e)[:300], "error")
             self._log(traceback.format_exc()[-800:], "error")
@@ -1776,6 +1862,7 @@ class GuardFishBot:
             self._finish_stage_timing("运行终止")
             self._debug_write("run_end", state=self.status.get("state"))
             self._battle_active = False
+            self._paused = False
             try:
                 self._close_browser()
             except Exception:
@@ -1794,6 +1881,8 @@ class GuardFishBot:
                     setattr(self, attr, None)
 
     def _sleep_gap(self):
+        if self._pause_requested:
+            return
         lo, hi = min(self.gap_min, self.gap_max), max(self.gap_min, self.gap_max)
         if hi <= 0:
             return
@@ -1801,7 +1890,7 @@ class GuardFishBot:
         self._log("场间等待 %.0f 秒…" % sec)
         t0 = time.time()
         while time.time() - t0 < sec:
-            if self._stop.is_set():
+            if self._stop.is_set() or self._pause_requested:
                 return
             time.sleep(0.5)
 
@@ -1813,6 +1902,11 @@ class GuardFishBot:
             # “推进 N 关”表示在本场起始关基础上再推进 N 个关卡。
             targets.append(int(stage0) + self.advance_stages)
         return max(targets) if targets else None
+
+    @staticmethod
+    def _is_lobby(st):
+        return bool(st.get("canChallenge") and not any(
+            st.get(k) for k in ("inBattle", "skillPanel", "finalSkillList", "result", "treasure")))
 
     def _one_battle(self, idx):
         """打一场，返回统计 dict 或 None"""
@@ -1827,6 +1921,7 @@ class GuardFishBot:
         self._stage_target = None
         self._stage_stop_announced = False
         self._one_hit_kills = 0
+        self._last_runtime_kills = 0
         with self._lock:
             self._battle_boxes = 0
         self._server_reject_ts = 0
@@ -1865,6 +1960,8 @@ class GuardFishBot:
         started, info = self._try_start_battle()
         skills_chosen = list(info.get("skills") or [])
         if not started:
+            if self._stop.is_set():
+                return None
             self._log("开局未成功，刷新页面后重试一次…", "warn")
             self._snap("pre_battle_retry")
             try:
@@ -1898,6 +1995,7 @@ class GuardFishBot:
         hp_found_logged = False
         last_progress_ts = time.time()
         last_sig = None
+        last_stall_warning = 0
         end_started = None
         try:
             self._page.evaluate(JS_HP_DRAIN)      # 清掉上一场的残留事件
@@ -1908,6 +2006,8 @@ class GuardFishBot:
                 return None
             # 运行中的开关和自然结束请求都在机器人线程执行，GUI 点击会在这里生效。
             elapsed = time.time() - t_battle0
+            if self._pause_requested:
+                self.request_natural_end("暂时停止")
             with self._control_lock:
                 natural_requested = bool(self._natural_end_requested)
             if end_started is None and not natural_requested and elapsed >= self.max_battle_seconds:
@@ -1916,19 +2016,13 @@ class GuardFishBot:
             self._apply_runtime_controls()
             if end_started is None and natural_requested:
                 end_started = time.time()
+                self.status["state"] = "等待结算"
                 self._log("进入自然结束宽限期（最多 %d 秒）" % END_GRACE_SECONDS, "warn")
-            if end_started is not None and time.time() - end_started > END_GRACE_SECONDS:
-                ended = "超时未结算"
-                with self._control_lock:
-                    # 只有自然结束未能结算时才阻止继续开新场。
-                    self._stop_after_battle = True
-                self._log("自然结束后 %d 秒仍未出现结算，停止继续开新场，避免同一对局被重复计场。" % END_GRACE_SECONDS,
-                          "error")
-                break
             time.sleep(TICK)
             st = self._state()
-            if not st:
+            if not st and (end_started is None or time.time() - end_started <= END_GRACE_SECONDS):
                 continue
+            st = st or {}
             self._sync_status(st)
             self._debug_capture(st)
             wm = st.get("wm") or {}
@@ -1971,7 +2065,10 @@ class GuardFishBot:
                 if gf.get("err"):
                     self._log("回血守护异常：%s" % str(gf.get("err"))[:120], "warn")
                 if gf.get("oneHitKills") is not None:
-                    self._one_hit_kills = int(gf.get("oneHitKills") or 0)
+                    runtime_kills = int(gf.get("oneHitKills") or 0)
+                    self._one_hit_kills += (runtime_kills - self._last_runtime_kills
+                                           if runtime_kills >= self._last_runtime_kills else runtime_kills)
+                    self._last_runtime_kills = runtime_kills
                     self.status["one_hit_kills"] = self._one_hit_kills
                 for ev in (gf.get("events") or []):
                     if ev.get("type") == "refill":
@@ -1991,8 +2088,9 @@ class GuardFishBot:
                         self._log("回血守护：本场已到 %s 分钟，停止回血让战斗自然结束（避免服务端超时判异常）"
                                   % ev.get("mins", 9))
 
-            # 战斗停滞检测（服务端限制 / 卡死）：任意状态变化都算进展
+            # 慢关不代表结算：击杀和波次也算进展，无进展只提示，不刷新/计场。
             sig = (stage.get("curStage"), stage.get("curHp"), hp_refill_count,
+                   self._one_hit_kills, (gf or {}).get("progress"),
                    bool(st.get("skillPanel")), bool(st.get("result")), bool(st.get("treasure")),
                    bool(st.get("hudClaimable")), bool(st.get("finalSkillList")))
             if sig != last_sig:
@@ -2000,14 +2098,14 @@ class GuardFishBot:
                 last_progress_ts = time.time()
             stuck_by_server = self._server_reject_ts and (time.time() - self._server_reject_ts > 15)
             stuck_by_time = (time.time() - last_progress_ts) > 240
-            if st.get("inBattle") and (stuck_by_server or stuck_by_time) \
+            if st.get("inBattle") and not self._natural_end_requested \
                     and not st.get("skillPanel") and not st.get("result") and not st.get("treasure") \
                     and not st.get("finalSkillList"):
-                self._log("战斗停滞（%s），判定本场结束，稍后刷新恢复"
-                          % ("服务端限制" if stuck_by_server else "长时间无进展"), "warn")
-                self._snap("battle_stuck")
-                ended = "停滞恢复"
-                break
+                if stuck_by_server:
+                    self.request_natural_end("服务端拒绝对局请求，尝试正常收尾")
+                elif stuck_by_time and time.time() - last_stall_warning > 240:
+                    last_stall_warning = time.time()
+                    self._log("较长时间未观测到进展，继续监控；只有实际结算返回主界面才计场，单场时限仍生效。", "warn")
 
             # 记录 HUD 结构一次（供诊断）
             if st.get("inBattle") and not snap_done:
@@ -2022,10 +2120,13 @@ class GuardFishBot:
 
             el = int(time.time() - t_battle0)
             self.status["refills"] = hp_refill_count
+            engine_hp = ((gf or {}).get("hp") or {}).get("cur")
+            shown_hp = engine_hp if isinstance(engine_hp, (int, float)) else stage.get("curHp", "?")
+            self.status["hp"] = shown_hp
             if el - last_hud >= 60:
                 last_hud = el
                 self._log("进行中 t=%ss 第%s关 HP=%s 免费剩余=%s 回血=%d%s"
-                          % (el, stage.get("curStage", "?"), stage.get("curHp", "?"),
+                          % (el, stage.get("curStage", "?"), shown_hp,
                              wm.get("freeNum", "?"), hp_refill_count,
                              (" 秒杀=%d" % self._one_hit_kills) if self.one_hit else ""))
 
@@ -2049,12 +2150,35 @@ class GuardFishBot:
                 returned_to_lobby = bool(st3.get("canChallenge"))
                 actual_result = bool(modal_result and
                                      (battle_over_after or returned_to_lobby))
-                if actual_result and not st3.get("result") and not st3.get("treasure"):
+                if actual_result:
                     result_text = candidate_result_text or ""
-                    ended = "结算完成"
-                    break
+                    if self._is_lobby(st3):
+                        ended = "结算完成"
+                        break
                 if modal_result and not actual_result:
                     self._log("奖励弹窗已关闭，战斗仍在继续，忽略本次弹窗作为结束信号。", "dim")
+                st = st3
+
+            if self._is_lobby(st):
+                self._log("战斗已结束（回到主界面）", "warn")
+                ended = "结算完成" if result_text else "提前结束"
+                break
+
+            if end_started is not None and time.time() - end_started > END_GRACE_SECONDS:
+                if not self.pause_on_timeout:
+                    self._log("自然结束等待已达 %d 秒仍未结算，停止本次命令行运行；本场不计入完成场数。"
+                              % END_GRACE_SECONDS, "error")
+                    return None
+                self._log("自然结束等待已达 %d 秒，尚未确认结算：暂停助手并保留本场，不计场、不刷新；"
+                          "点击「恢复战斗」后重新识别当前战斗或主界面。" % END_GRACE_SECONDS, "warn")
+                with self._control_lock:
+                    self._pause_requested = True
+                if not self._wait_if_paused(unfinished=True):
+                    return None
+                # 在原战斗循环继续，不重置起始关/推进目标、技能、战报和累计计数。
+                end_started = time.time()
+                last_progress_ts = time.time()
+                continue
 
             # 3.2 关卡技能三选一
             cards = st.get("skillPanel")
@@ -2083,14 +2207,6 @@ class GuardFishBot:
                         self._log("宝箱奖励弹窗已关闭")
                         time.sleep(1.0)
 
-            # 3.4 异常兜底：若既不在战场也无面板
-            if not st.get("inBattle") and not st.get("skillPanel") and not st.get("result") \
-                    and not st.get("treasure") and not st.get("finalSkillList"):
-                # 可能已经回到主页面（提前结束）
-                if st.get("canChallenge"):
-                    self._log("战斗已结束（回到主界面）", "warn")
-                    ended = "提前结束"
-                    break
 
         dur = time.time() - t_battle0
         self._battle_active = False
@@ -2109,19 +2225,6 @@ class GuardFishBot:
                 time.sleep(1.5)
             else:
                 break
-
-        # 3.6 停滞/异常恢复：战场卡死 → 刷新页面（该场已被服务端结束，刷新安全）
-        if ended == "停滞恢复":
-            try:
-                self._log("刷新页面恢复…", "warn")
-                self._runtime_script_loaded = False
-                self._runtime_applied = None
-                self._page.reload(wait_until="domcontentloaded", timeout=60000)
-                self._wait_ready(60)
-                self._apply_hp_config()
-                self._log("页面已恢复")
-            except Exception as e:
-                self._log("刷新恢复失败：%s" % str(e)[:120], "error")
 
         final = self._state() or {}
         fwm = (final.get("wm") or {})
