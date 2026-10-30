@@ -11,6 +11,7 @@ PARAMETERS = {
     'fire_crit': ('暴击伤害', '倍', 2.0, 0.0, 100.0),
     'ice_duration': ('冰冻时长', '秒', 3.0, 0.1, 180.0),
     'earth_slow': ('土系减速', '%', 50.0, 0.0, 100.0),
+    'earth_duration': ('土系持续', '秒', 3.0, 0.1, 180.0),
 }
 
 
@@ -347,7 +348,7 @@ JS_COMBAT_INSTALL = r"""
       return result;
     });
     const hitEnabled = fixedAttack || cfg.repeat_ice || cfg.repeat_earth ||
-      ['thunder_count', 'ice_duration', 'earth_slow'].some(parameterOn) ||
+      ['thunder_count', 'ice_duration', 'earth_slow', 'earth_duration'].some(parameterOn) ||
       ['thunder', 'ice', 'wind'].some(k => cfg.effects[k] && cfg.effects[k].enabled);
     method(meta, loop, '_applyProjectileHit', !!hitEnabled && !GF.finishing, original => function(card, target) {
       const name = card && camps[card.camp], rule = cfg.effects[name];
@@ -378,6 +379,11 @@ JS_COMBAT_INSTALL = r"""
         if (card.camp === 2 && parameterOn('earth_slow')) {
           const factor = card.campVal2 > 1 ? 0 : clamp(card.campVal2, 0, 1);
           setExtra('campVal2', 1 - adjusted('earth_slow', (1 - factor) * 100, 0, 100) / 100);
+        }
+        if (card.camp === 2 && parameterOn('earth_duration')) {
+          const seconds = adjusted('earth_duration', card.attrVal * (1 + card.campVal1), 0.1, 180);
+          setExtra('attrVal', seconds);
+          setExtra('campVal1', 0);
         }
         return original.apply(this, arguments);
       }

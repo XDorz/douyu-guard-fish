@@ -61,6 +61,43 @@ class CombatWidgets:
             ttk.Label(second, text='秒', font=self.small_font).pack(side='left', padx=(3, 0))
         return first
 
+    def _effect_group(self, key, parent, title):
+        """分系两行：第一行放开关、模式和概率，第二行留给 CD/附加参数。"""
+        group = {
+            'enabled': tk.BooleanVar(value=False), 'mode': tk.StringVar(value='倍率'),
+            'value': tk.StringVar(value='40' if key == 'ice' else '50'),
+            'last_mode': 'multiplier', 'cache': {'fixed': '40' if key == 'ice' else '50',
+                                                  'multiplier': '1'},
+        }
+        self.groups[key] = group
+        first = ttk.Frame(parent)
+        first.pack(anchor='w', fill='x')
+        ttk.Checkbutton(first, text=title, variable=group['enabled'],
+                        command=self.flush).pack(side='left', padx=(0, 4))
+        box = ttk.Combobox(first, textvariable=group['mode'], values=('倍率', '固定'),
+                           width=5, state='readonly', font=self.font)
+        box.pack(side='left', padx=(0, 4))
+        box.bind('<<ComboboxSelected>>', lambda _e: self._mode_changed(key))
+        group['label'] = ttk.Label(first, text='倍率', font=self.small_font)
+        group['label'].pack(side='left', padx=(0, 2))
+        entry = ttk.Entry(first, textvariable=group['value'], width=5, font=self.font)
+        entry.pack(side='left', padx=(0, 2))
+        entry.bind('<Return>', lambda _e: self.flush())
+        entry.bind('<FocusOut>', lambda _e: self.flush())
+        group['unit'] = ttk.Label(first, text='倍', font=self.small_font)
+        group['unit'].pack(side='left')
+        second = ttk.Frame(parent)
+        second.pack(anchor='w', fill='x', pady=(5, 0))
+        if key == 'wind':
+            group['cd'] = tk.StringVar(value='-1')
+            ttk.Label(second, text='CD', font=self.small_font).pack(side='left')
+            cd = ttk.Entry(second, textvariable=group['cd'], width=4, font=self.font)
+            cd.pack(side='left', padx=(4, 2))
+            cd.bind('<Return>', lambda _e: self.flush())
+            cd.bind('<FocusOut>', lambda _e: self.flush())
+            ttk.Label(second, text='秒', font=self.small_font).pack(side='left')
+        return second
+
     def _click_outside_editor(self, event):
         if self.loading:
             return
@@ -86,9 +123,6 @@ class CombatWidgets:
                         command=self.flush).pack(side='left', padx=(0, 12))
         ttk.Checkbutton(repeat, text='土可重复', variable=self.repeat_earth,
                         command=self.flush).pack(side='left')
-        earth = ttk.Frame(parent)
-        earth.pack(anchor='w', pady=(0, 2))
-        self._group('earth_slow', earth, PARAMETERS['earth_slow'][0])
 
     def build_effects(self, parent):
         ttk.Separator(parent, orient='horizontal').pack(fill='x', pady=(7, 10))
@@ -96,20 +130,24 @@ class CombatWidgets:
         panel.pack(anchor='nw', fill='x')
         panel.columnconfigure(0, weight=1)
         panel.columnconfigure(2, weight=1)
-        ttk.Separator(panel, orient='vertical').grid(row=0, column=1, rowspan=3, sticky='ns', padx=12)
-        ttk.Separator(panel, orient='horizontal').grid(row=1, column=0, columnspan=3, sticky='ew', pady=8)
+        ttk.Separator(panel, orient='vertical').grid(row=0, column=1, rowspan=5, sticky='ns', padx=12)
+        ttk.Separator(panel, orient='horizontal').grid(row=1, column=0, columnspan=3, sticky='ew', pady=7)
+        ttk.Separator(panel, orient='horizontal').grid(row=3, column=0, columnspan=3, sticky='ew', pady=7)
         for index, name in enumerate(EFFECTS):
             frame = ttk.Frame(panel)
             frame.grid(row=(index // 2) * 2, column=(index % 2) * 2, sticky='nw')
-            self._group(name, frame, EFFECT_LABELS[name])
+            second = self._effect_group(name, frame, EFFECT_LABELS[name])
             key = {'thunder': 'thunder_count', 'fire': 'fire_crit', 'ice': 'ice_duration'}.get(name)
             if key:
-                extra = ttk.Frame(frame)
-                extra.pack(anchor='w', pady=(6, 0))
-                self._group(key, extra, PARAMETERS[key][0])
-        notes = ttk.Label(parent, text='风系 CD：-1 原速，最低 0.5 秒。时间单位为游戏秒。\n数字失焦或回车后应用；各项独立勾选生效。',
-                          font=self.small_font, foreground='#666', justify='left', anchor='nw')
-        notes.pack(anchor='nw', pady=(9, 0))
+                self._group(key, second, PARAMETERS[key][0])
+        notes = ttk.Label(panel, text='风系 CD：-1 原速，最低 0.5 秒。\n时间单位为游戏秒；数字失焦或回车后应用。\n各项独立勾选生效。',
+                          font=self.small_font, foreground='#666', justify='left', anchor='nw',
+                          wraplength=245)
+        notes.grid(row=4, column=0, sticky='nw', pady=(0, 2))
+        earth = ttk.Frame(panel)
+        earth.grid(row=4, column=2, sticky='nw')
+        self._group('earth_slow', earth, PARAMETERS['earth_slow'][0])
+        self._group('earth_duration', earth, PARAMETERS['earth_duration'][0])
 
     def _schedule(self, *_args):
         if self.loading:

@@ -1091,7 +1091,7 @@ class GuardFishBot:
     def set_runtime_controls(self, hp_guard=None, one_hit=None, hp_threshold=None,
                              one_hit_mode=None, one_hit_probability=None,
                              attack_multiplier=None, attack_fixed=None, finish_fast=None,
-                             combat_controls=None):
+                             combat_controls=None, max_battle_seconds=None):
         """更新运行中的回血/秒杀开关；实际页面操作由机器人线程执行。"""
         with self._control_lock:
             if hp_guard is not None:
@@ -1110,6 +1110,8 @@ class GuardFishBot:
                 self.attack_fixed = max(float(attack_fixed), 1.0)
             if finish_fast is not None:
                 self.finish_fast = bool(finish_fast)
+            if max_battle_seconds is not None:
+                self.max_battle_seconds = max(float(max_battle_seconds), 1.0)
             if combat_controls is not None:
                 self.combat_controls = normalize_controls(combat_controls, self.combat_controls)
             self._runtime_pending = True

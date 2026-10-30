@@ -73,8 +73,8 @@ class App:
 
         top = ttk.Frame(body)
         top.grid(row=0, column=0, sticky="ew")
-        top.columnconfigure(0, weight=1)
-        top.columnconfigure(2, weight=1)
+        top.columnconfigure(0, weight=9)
+        top.columnconfigure(2, weight=11)
         task = ttk.Frame(top)
         task.grid(row=0, column=0, sticky="nw")
         ttk.Separator(top, orient="vertical").grid(row=0, column=1, sticky="ns", padx=12)
@@ -110,11 +110,15 @@ class App:
         self.gap_min = tk.StringVar(value="5")
         self.gap_max = tk.StringVar(value="15")
 
-        def field(row, title, var, width=5, suffix=""):
+        def field(row, title, var, width=5, suffix="", on_change=None):
             group = ttk.Frame(row)
             group.pack(side="left", padx=(0, 12))
             ttk.Label(group, text=title, font=FONT).pack(side="left")
-            ttk.Entry(group, textvariable=var, width=width, font=FONT).pack(side="left", padx=(4, 3))
+            entry = ttk.Entry(group, textvariable=var, width=width, font=FONT)
+            entry.pack(side="left", padx=(4, 3))
+            if on_change:
+                entry.bind("<Return>", lambda _e: on_change())
+                entry.bind("<FocusOut>", lambda _e: on_change())
             if suffix:
                 ttk.Label(group, text=suffix, font=FONT_S, foreground="#666").pack(side="left")
             return group
@@ -145,7 +149,7 @@ class App:
         self.max_minutes = tk.StringVar(value="13")
         field(targets, "固定关卡", self.stop_stage, 5, "关")
         field(targets, "推进", self.advance_stages, 5, "关")
-        field(targets, "单场最长", self.max_minutes, 5, "分钟")
+        field(targets, "单场最长", self.max_minutes, 5, "分钟", self._runtime_options_changed)
         ttk.Label(targets, text="关卡目标 0=关闭", font=FONT_S, foreground="#666").pack(side="left")
 
         options = ttk.Frame(parent)
@@ -415,6 +419,11 @@ class App:
             threshold = int((self.hp_threshold.get() or "5").strip() or 5)
         except ValueError:
             threshold = 5
+        try:
+            max_minutes = float((self.max_minutes.get() or "13").strip() or 13)
+            max_seconds = max_minutes * 60 if max_minutes > 0 else None
+        except ValueError:
+            max_minutes, max_seconds = None, None
         self.bot.set_runtime_controls(hp_guard=self.hp_var.get(),
                                       one_hit=self.one_hit_var.get(),
                                       hp_threshold=max(threshold, 1),
@@ -422,7 +431,8 @@ class App:
                                       one_hit_probability=probability,
                                       attack_multiplier=multiplier,
                                       attack_fixed=attack_fixed,
-                                      finish_fast=self.finish_fast_var.get())
+                                      finish_fast=self.finish_fast_var.get(),
+                                      max_battle_seconds=max_seconds)
         self._log("[系统] 已提交实时开关：回血=%s，秒杀=%s，尽快完成=%s（策略=%s，失焦/回车后生效）"
                   % ("开" if self.hp_var.get() else "关",
                      "开" if self.one_hit_var.get() else "关",
