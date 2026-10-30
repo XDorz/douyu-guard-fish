@@ -21,7 +21,8 @@ LOG_Q = queue.Queue()
 FONT = ("Microsoft YaHei UI", 10)
 FONT_B = ("Microsoft YaHei UI", 10, "bold")
 FONT_S = ("Microsoft YaHei UI", 9)
-ONE_HIT_MODE_LABELS = (("全额秒杀", "full"), ("概率秒杀", "probability"), ("攻击倍率", "multiplier"))
+ONE_HIT_MODE_LABELS = (("全额秒杀", "full"), ("概率秒杀", "probability"),
+                       ("攻击倍率", "multiplier"), ("攻击力固定", "fixed_attack"))
 ONE_HIT_MODE_KEYS = {label: key for label, key in ONE_HIT_MODE_LABELS}
 
 
@@ -32,7 +33,7 @@ class App:
         self._save_job = None
         self._config_error_logged = False
         self._settings = dict(settings.DEFAULTS)
-        self._mode_values = {"probability": "50", "multiplier": "2"}
+        self._mode_values = {"probability": "50", "multiplier": "2", "fixed_attack": "100000"}
         self.running = False
         self.thread = None
         self.bot = None
@@ -60,12 +61,13 @@ class App:
     def _build(self):
         top = ttk.Frame(self.root, padding=(10, 10, 10, 4))
         top.pack(fill="x")
+        top.columnconfigure(0, weight=1)
         header = ttk.Frame(top)
         header.grid(row=0, column=0, sticky="w")
         options = ttk.Frame(top)
         options.grid(row=2, column=0, sticky="w", pady=(8, 0))
         actions = ttk.Frame(top)
-        actions.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        actions.grid(row=1, column=0, sticky="ew", pady=(8, 0))
 
         ttk.Label(header, text="房间号", font=FONT).grid(row=0, column=0, sticky="w")
         self.rid = tk.StringVar(value=botmod.DEFAULT_RID)
@@ -92,12 +94,16 @@ class App:
         hp_entry = ttk.Entry(hp_frame, textvariable=self.hp_threshold, width=4, font=FONT)
         hp_entry.pack(side="left", padx=3)
         hp_entry.bind("<Return>", lambda _e: self._runtime_options_changed())
+        hp_entry.bind("<FocusOut>", lambda _e: self._runtime_options_changed())
         ttk.Label(hp_frame, text="滴自动回满", font=FONT_S, foreground="#666").pack(side="left")
 
         # 银币续打：免费用尽后花银币继续（银币免费获取，不用鱼翅）
         self.coin_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(options, text="免费用尽后用银币续打（银币免费获得）",
                         variable=self.coin_var).pack(side="left", padx=(0, 20))
+        self.finish_fast_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(options, text="尽快完成", variable=self.finish_fast_var,
+                        command=self._runtime_options_changed).pack(side="left")
 
         # 秒杀策略：默认保留原来的全额秒杀，也可切换成概率或攻击倍率。
         combat_row = ttk.Frame(top)
@@ -111,13 +117,13 @@ class App:
         self.one_hit_mode = tk.StringVar(value="全额秒杀")
         self._last_one_hit_mode = "full"
         self.one_hit_mode_box = ttk.Combobox(
-            one_hit_frame, textvariable=self.one_hit_mode, width=8, state="readonly",
+            one_hit_frame, textvariable=self.one_hit_mode, width=10, state="readonly",
             values=[label for label, _ in ONE_HIT_MODE_LABELS], font=FONT)
         self.one_hit_mode_box.pack(side="left", padx=(5, 3))
         self.one_hit_mode_box.bind("<<ComboboxSelected>>", self._one_hit_mode_changed)
         self.one_hit_value = tk.StringVar(value="50")
         self.one_hit_value_entry = ttk.Entry(one_hit_frame, textvariable=self.one_hit_value,
-                                             width=5, font=FONT)
+                                             width=8, font=FONT)
         self.one_hit_value_entry.pack(side="left", padx=(0, 2))
         self.one_hit_value_entry.bind("<Return>", lambda _e: self._runtime_options_changed())
         self.one_hit_value_entry.bind("<FocusOut>", lambda _e: self._runtime_options_changed())
@@ -132,19 +138,19 @@ class App:
 
         self.start_btn = tk.Button(actions, text="开始挂机", width=11, font=FONT_B,
                                    bg="#43a047", fg="white", command=self.start)
-        self.start_btn.pack(side="left", padx=(0, 8))
+        self.start_btn.pack(side="left", fill="x", expand=True, padx=(0, 8))
         self.stop_btn = tk.Button(actions, text="终止并退出", width=10, font=FONT_B,
                                   state="disabled", command=self.stop)
-        self.stop_btn.pack(side="left", padx=(0, 8))
+        self.stop_btn.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
         self.end_btn = tk.Button(actions, text="本场正常结束", width=12, font=FONT_B,
                                  state="disabled", command=self.end_current)
-        self.end_btn.pack(side="left", padx=(0, 8))
+        self.end_btn.pack(side="left", fill="x", expand=True, padx=(0, 8))
         self.pause_btn = tk.Button(actions, text="暂时停止", width=10, font=FONT_B,
                                    state="disabled", command=self.pause_or_resume)
-        self.pause_btn.pack(side="left", padx=(0, 14))
-        ttk.Button(actions, text="登录斗鱼", width=10, command=self.login).pack(side="left", padx=(0, 6))
-        ttk.Button(actions, text="打开数据目录", width=12, command=self.open_dir).pack(side="left")
+        self.pause_btn.pack(side="left", fill="x", expand=True, padx=(0, 14))
+        ttk.Button(actions, text="登录斗鱼", width=10, command=self.login).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ttk.Button(actions, text="打开数据目录", width=12, command=self.open_dir).pack(side="left", fill="x", expand=True)
 
         # 关卡目标和单场监控时限。两个关卡目标同时设置时取较大的实际关卡数。
         # 每个配置使用一个紧凑的小组，避免 grid 跨列后产生过大的组内间距。
@@ -180,8 +186,8 @@ class App:
         panes.pack(fill="both", expand=True)
         frame = ttk.Frame(panes, padding=(10, 8, 0, 10))
         sidebar = ttk.Frame(panes, padding=(4, 8, 10, 10))
-        panes.add(frame, minsize=440, stretch="always")
-        panes.add(sidebar, minsize=310, width=340, stretch="never")
+        panes.add(frame, minsize=520, stretch="always")
+        panes.add(sidebar, minsize=260, width=275, stretch="never")
         self.combat_widgets.build_effects(sidebar)
         self.text = tk.Text(frame, wrap="word", height=22, font=("Consolas", 10))
         sb = ttk.Scrollbar(frame, command=self.text.yview)
@@ -198,6 +204,7 @@ class App:
             "rid": self.rid, "rounds": self.rounds, "gap_min": self.gap_min,
             "gap_max": self.gap_max, "hp_guard": self.hp_var,
             "hp_threshold": self.hp_threshold, "coin_play": self.coin_var,
+            "finish_fast": self.finish_fast_var,
             "one_hit": self.one_hit_var, "headless": self.headless_var,
             "stop_stage": self.stop_stage, "advance_stages": self.advance_stages,
             "max_minutes": self.max_minutes,
@@ -213,7 +220,8 @@ class App:
         self.one_hit_mode.set(dict((key, label) for label, key in ONE_HIT_MODE_LABELS)[mode])
         self._last_one_hit_mode = mode
         self._mode_values = {"probability": self._settings["one_hit_probability"],
-                             "multiplier": self._settings["attack_multiplier"]}
+                             "multiplier": self._settings["attack_multiplier"],
+                             "fixed_attack": self._settings["attack_fixed"]}
         self.one_hit_value.set(self._mode_values.get(mode, "50"))
         self._update_one_hit_mode_ui()
         if error:
@@ -237,7 +245,8 @@ class App:
             self._mode_values[mode] = self.one_hit_value.get()
         values.update(one_hit_mode=mode,
                       one_hit_probability=self._mode_values["probability"],
-                      attack_multiplier=self._mode_values["multiplier"])
+                      attack_multiplier=self._mode_values["multiplier"],
+                      attack_fixed=self._mode_values["fixed_attack"])
         # 输入框暂时为空或格式无效时保留上次有效值，不把半输入状态存到文件。
         self._settings = settings.normalize(values, self._settings)
         try:
@@ -279,8 +288,8 @@ class App:
                     self._round = "%s/%s" % (m.group(1), m.group(2))
                 m2 = re.search(r"进行中 t=(\d+)s 第(\S+)关 HP=(\S+) 免费剩余=(\S+)", line)
                 if m2:
-                    self._hud = ("进行中 %ss｜第%s关｜HP %s｜免费剩余 %s"
-                                 % (m2.group(1), m2.group(2), m2.group(3), m2.group(4)))
+                    self._hud = ("进行中 %ss｜第%s关｜HP %s"
+                                 % (m2.group(1), m2.group(2), m2.group(3)))
                 m3 = re.search(r"战报：起始第(\S+)关 → 到达第(\S+)关，用时 (\d+) 秒", line)
                 if m3:
                     self._hud = "上场：第%s→%s关，用时%ss" % (m3.group(1), m3.group(2), m3.group(3))
@@ -292,8 +301,8 @@ class App:
         self.root.after(150, self._pump)
 
     def _refresh_run_state(self):
-        b = self.bot if self.running else None
-        active = bool(b and not b._stop.is_set())
+        b = self.bot
+        active = bool(self.running and b and not b._stop.is_set())
         self.end_btn.config(state="normal" if active and b._battle_active
                             and not b._natural_end_requested and not b._paused else "disabled")
         paused = bool(b and b._paused)
@@ -302,10 +311,20 @@ class App:
                               state="normal" if active and not pending else "disabled")
         if b:
             st = b.status
-            self.status.set("%s · 已完成 %s/%s 场｜当前第 %s 场｜%s｜回血 %s 次｜银币 %s"
+            today = st.get("daily_count")
+            def count_text(value):
+                if isinstance(value, float) and value.is_integer():
+                    return str(int(value))
+                return str(value)
+            today_text = ("%s/%s" % (count_text(today), count_text(st.get("daily_target", 30)))
+                          if today is not None else "未读取")
+            if today is None and st.get('battleRound') is not None:
+                today_text += "（开战计数 %s）" % count_text(st['battleRound'])
+            free_text = count_text(st["freeNum"]) if st.get("freeNum") is not None else "-"
+            self.status.set("%s · 已完成 %s/%s 场｜免费剩余 %s｜今日场次 %s｜%s｜回血 %s 次｜银币 %s"
                             % ("正在收尾后暂停" if pending else st.get("state", "运行中"),
                                st.get("rounds_done", 0), b.rounds if b.rounds > 0 else "不限",
-                               st.get("round", "-"), getattr(self, "_hud", "启动中"),
+                               free_text, today_text, getattr(self, "_hud", "启动中"),
                                st.get("refills", 0), st.get("coin", "-")))
 
     # ---------- 控制 ----------
@@ -317,16 +336,21 @@ class App:
         try:
             value = float((self.one_hit_value.get() or "").strip())
         except ValueError:
-            value = 50.0 if mode == "probability" else 2.0
+            value = (50.0 if mode == "probability" else
+                     2.0 if mode == "multiplier" else 100000.0)
         if mode == "probability":
             value = max(0.0, min(value, 100.0))
             self.one_hit_value.set("%g" % value)
-            return mode, value, 2.0
+            return mode, value, 2.0, 100000.0
         if mode == "multiplier":
             value = max(value, 0.01)
             self.one_hit_value.set("%g" % value)
-            return mode, 50.0, value
-        return mode, 50.0, 2.0
+            return mode, 50.0, value, 100000.0
+        if mode == "fixed_attack":
+            value = max(value, 1.0)
+            self.one_hit_value.set("%g" % value)
+            return mode, 50.0, 2.0, value
+        return mode, 50.0, 2.0, 100000.0
 
     def _update_one_hit_mode_ui(self):
         mode = self._one_hit_mode_key()
@@ -335,6 +359,9 @@ class App:
             self.one_hit_value_entry.config(state="normal")
         elif mode == "multiplier":
             self.one_hit_unit.config(text="倍")
+            self.one_hit_value_entry.config(state="normal")
+        elif mode == "fixed_attack":
+            self.one_hit_unit.config(text="攻")
             self.one_hit_value_entry.config(state="normal")
         else:
             self.one_hit_unit.config(text="")
@@ -361,10 +388,12 @@ class App:
         """复选框点击后通知运行线程；Playwright 调用仍在机器人线程中执行。"""
         self._desired_hp_guard = bool(self.hp_var.get())
         self._desired_one_hit = bool(self.one_hit_var.get())
-        mode, probability, multiplier = self._one_hit_values()
+        mode, probability, multiplier, attack_fixed = self._one_hit_values()
         self._desired_one_hit_mode = mode
         self._desired_one_hit_probability = probability
         self._desired_attack_multiplier = multiplier
+        self._desired_attack_fixed = attack_fixed
+        self._desired_finish_fast = bool(self.finish_fast_var.get())
         if not (self.running and self.bot):
             return
         try:
@@ -376,11 +405,14 @@ class App:
                                       hp_threshold=max(threshold, 1),
                                       one_hit_mode=mode,
                                       one_hit_probability=probability,
-                                      attack_multiplier=multiplier)
-        self._log("[系统] 已提交实时开关：回血=%s，秒杀=%s（策略=%s，约半秒内生效）"
+                                      attack_multiplier=multiplier,
+                                      attack_fixed=attack_fixed,
+                                      finish_fast=self.finish_fast_var.get())
+        self._log("[系统] 已提交实时开关：回血=%s，秒杀=%s，尽快完成=%s（策略=%s，失焦/回车后生效）"
                   % ("开" if self.hp_var.get() else "关",
                      "开" if self.one_hit_var.get() else "关",
-                     botmod.one_hit_mode_text(mode, probability, multiplier)), "dim")
+                     "开" if self.finish_fast_var.get() else "关",
+                     botmod.one_hit_mode_text(mode, probability, multiplier, attack_fixed)), "dim")
 
     def start(self):
         if self.running:
@@ -399,7 +431,7 @@ class App:
             stop_stage = int((self.stop_stage.get() or "0").strip() or 0)
             advance_stages = int((self.advance_stages.get() or "0").strip() or 0)
             max_minutes = float((self.max_minutes.get() or "13").strip() or 13)
-            one_hit_mode, one_hit_probability, attack_multiplier = self._one_hit_values()
+            one_hit_mode, one_hit_probability, attack_multiplier, attack_fixed = self._one_hit_values()
         except ValueError:
             messagebox.showwarning("输入错误", "房间号/场数/等待时间/回血阈值/关卡目标/时限/秒杀参数格式不对")
             return
@@ -418,6 +450,9 @@ class App:
         if one_hit_mode == "multiplier" and attack_multiplier <= 0:
             messagebox.showwarning("输入错误", "攻击倍率必须大于 0")
             return
+        if one_hit_mode == "fixed_attack" and attack_fixed < 1:
+            messagebox.showwarning("输入错误", "固定攻击力必须大于 0")
+            return
         if hp_th < 1:
             hp_th = 1
         if gap_max < gap_min:
@@ -435,6 +470,8 @@ class App:
         self._desired_one_hit_mode = one_hit_mode
         self._desired_one_hit_probability = one_hit_probability
         self._desired_attack_multiplier = attack_multiplier
+        self._desired_attack_fixed = attack_fixed
+        self._desired_finish_fast = bool(self.finish_fast_var.get())
         self._hud = ""
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
@@ -446,24 +483,28 @@ class App:
         if self.hp_var.get():
             self._log("[系统] 回血守护：开（血量 < %d 自动回满）" % hp_th)
         self._log("[系统] 银币续打：%s" % ("开（免费用尽后银币≥10 自动继续）" if self.coin_var.get() else "关"))
+        self._log("[系统] 尽快完成：%s" % ("开（每场开始即正常收尾，场次继续推进）"
+                                          if self.finish_fast_var.get() else "关"))
         if self.one_hit_var.get():
             self._log("[系统] 秒杀模式：开（策略=%s）" %
                       botmod.one_hit_mode_text(one_hit_mode, one_hit_probability,
-                                               attack_multiplier))
+                                               attack_multiplier, attack_fixed))
         self.thread = threading.Thread(target=self._run,
                                        args=(rid, rounds, gap_min, gap_max, self.headless_var.get(),
                                              self.hp_var.get(), hp_th, self.coin_var.get(),
                                              self.one_hit_var.get(), max_minutes * 60,
                                              stop_stage, advance_stages,
                                              one_hit_mode, one_hit_probability,
-                                             attack_multiplier),
+                                             attack_multiplier, attack_fixed,
+                                             self.finish_fast_var.get()),
                                        daemon=True)
         self.thread.start()
 
     def _run(self, rid, rounds, gap_min, gap_max, headless, hp_guard, hp_th, coin_play,
              one_hit=False, max_battle_seconds=botmod.MAX_BATTLE_SECONDS,
              stop_stage=0, advance_stages=0, one_hit_mode="full",
-             one_hit_probability=50.0, attack_multiplier=2.0):
+             one_hit_probability=50.0, attack_multiplier=2.0,
+             attack_fixed=100000.0, finish_fast=False):
         try:
             self.bot = botmod.GuardFishBot(rid=rid, rounds=rounds, gap_min=gap_min,
                                            gap_max=gap_max, headless=headless,
@@ -475,6 +516,8 @@ class App:
                                            one_hit_mode=one_hit_mode,
                                            one_hit_probability=one_hit_probability,
                                            attack_multiplier=attack_multiplier,
+                                           attack_fixed=attack_fixed,
+                                           finish_fast=finish_fast,
                                            debug=self.debug, pause_on_timeout=True,
                                            combat_controls=self._desired_combat)
             # 如果用户在工作线程刚启动的瞬间点击了复选框，以当前 GUI 值为准。
@@ -483,6 +526,8 @@ class App:
                                           one_hit_mode=self._desired_one_hit_mode,
                                           one_hit_probability=self._desired_one_hit_probability,
                                           attack_multiplier=self._desired_attack_multiplier,
+                                          attack_fixed=self._desired_attack_fixed,
+                                          finish_fast=self._desired_finish_fast,
                                           combat_controls=self._desired_combat)
             self.bot.add_log_sink(lambda line, level=None: LOG_Q.put((line, level)))
             self.bot.start()
@@ -498,7 +543,10 @@ class App:
         self.stop_btn.config(state="disabled")
         self.end_btn.config(state="disabled")
         self.pause_btn.config(state="disabled", text="暂时停止")
-        self.status.set("状态：已停止")
+        if self.bot:
+            self._refresh_run_state()
+        else:
+            self.status.set("状态：已停止")
         self._log("[系统] 已停止")
 
     def login(self):

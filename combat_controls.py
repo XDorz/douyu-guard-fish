@@ -14,7 +14,10 @@ def default_controls():
         "repeat_ice": False, "repeat_earth": False,
         "effects": {name: {"enabled": False, "mode": "multiplier", "multiplier": 1.0,
                            "probability": 40.0 if name == "ice" else 50.0,
-                           "cd": 8.0 if name == "wind" else 0.0} for name in EFFECTS},
+                           # -1 means keep the native timing.  In particular, the
+                           # native wind floor remains in force instead of turning
+                           # an empty field into an accidental 0.5-second override.
+                           "cd": -1.0} for name in EFFECTS},
     }
 
 
@@ -49,7 +52,16 @@ def normalize_controls(values, base=None):
         if effect:
             target["probability"] = _number(raw.get("probability"), target["probability"], 0, 100)
             target["multiplier"] = _number(raw.get("multiplier"), target["multiplier"], 0, 100)
-            target["cd"] = _number(raw.get("cd"), target["cd"], *CD_LIMITS[effect])
+            raw_cd = raw.get("cd")
+            try:
+                parsed_cd = float(raw_cd)
+                if parsed_cd == -1:
+                    # Only -1 preserves native timing; all other values clamp.
+                    target["cd"] = -1.0
+                else:
+                    target["cd"] = _number(raw_cd, target["cd"], *CD_LIMITS[effect])
+            except (TypeError, ValueError, OverflowError):
+                pass
         else:
             target["fixed"] = _number(raw.get("fixed"), target["fixed"], 0.2, 180)
             mult = _number(raw.get("multiplier"), target["multiplier"], -100, 100)
@@ -209,7 +221,8 @@ JS_COMBAT_INSTALL = r"""
     let meta = metas.get(loop);
     if (!meta) {
       meta = {loop, id: ++nextId, stage: null, methods: new Map(), counted: new WeakSet(),
-              triggered: new Map(), clock: 0, applied: {attack_speed: {enabled: false}, effects: {}}, version: -1, held: null};
+              triggered: new Map(), clock: 0, applied: {attack_speed: {enabled: false}, effects: {}},
+              version: -1, held: null, endWarmup: false};
       metas.set(loop, meta);
     }
     if (GF.wrappedLoops.indexOf(loop) < 0) GF.wrappedLoops.push(loop);
@@ -231,25 +244,47 @@ JS_COMBAT_INSTALL = r"""
         if (!before || !before.enabled || !after || !after.enabled) meta.triggered.delete(card.cardInstanceId);
       }
       const wind = cfg.effects.wind;
-      if (wind && wind.enabled && typeof loop.windRowCooldownMs === 'number')
+      if (wind && wind.enabled && wind.cd >= 0 && typeof loop.windRowCooldownMs === 'number')
         loop.windRowCooldownMs = Math.min(loop.windRowCooldownMs, wind.cd * 1000);
       meta.applied = cfg;
       meta.version = version;
     }
     const fire = cfg.effects.fire;
     const customCD = ['thunder', 'ice'].some(k => cfg.effects[k] && cfg.effects[k].enabled && cfg.effects[k].cd > 0);
-    const attacks = GF.finishing || cfg.attack_speed.enabled || fire && fire.enabled || customCD;
+    const fixedAttack = !!(GF.oneHit && GF.oneHitMode === 'fixed_attack');
+    const attacks = GF.finishing || fixedAttack || cfg.attack_speed.enabled || fire && fire.enabled || customCD;
     method(meta, loop, '_updateCardAttacks', !!attacks, original => function(dt) {
       meta.clock += Math.max(0, Number(dt) || 0) * 1000;
       if (GF.finishing) {
+        // If the end request arrived before the first projectile of this
+        // engine, allow one native attack update.  This avoids a zero-damage
+        // battle when the request was made on the card-selection screen.
+        let result;
+        if (meta.endWarmup) {
+          const beforeIds = Number(this._nextProjectileId);
+          try {
+            result = original.apply(this, arguments);
+            const afterIds = Number(this._nextProjectileId);
+            if (Number.isFinite(beforeIds) && Number.isFinite(afterIds) && afterIds > beforeIds) {
+              meta.endWarmup = false;
+              GF.endWarmup = false;
+            }
+          } finally {
+            if (!meta.endWarmup) holdAttacks(this, meta, dt);
+          }
+          return result;
+        }
         holdAttacks(this, meta, dt);
-        return original.apply(this, arguments);
+        return undefined;
       }
       const saved = [];
       const fire = cfg.effects.fire;
+      const fixedNow = !!(GF.oneHit && GF.oneHitMode === 'fixed_attack');
+      const fixedValue = Math.max(1, Number(GF.attackFixed) || 1);
       const set = (object, key, value) => { saved.push([object, key, object[key]]); object[key] = value; };
       try {
         for (const card of this.cards || []) {
+          if (fixedNow) set(card, 'attack', fixedValue);
           if (cfg.attack_speed.enabled) {
             const mul = this._resolveAttackSpeedMul(card.camp);
             set(card, 'attackSpeed', interval(this, card, cfg.attack_speed) * mul * 1000);
@@ -276,7 +311,7 @@ JS_COMBAT_INSTALL = r"""
       }
       return result;
     });
-    const hitEnabled = cfg.repeat_ice || cfg.repeat_earth || ['thunder', 'ice', 'wind'].some(k => cfg.effects[k] && cfg.effects[k].enabled);
+    const hitEnabled = fixedAttack || cfg.repeat_ice || cfg.repeat_earth || ['thunder', 'ice', 'wind'].some(k => cfg.effects[k] && cfg.effects[k].enabled);
     method(meta, loop, '_applyProjectileHit', !!hitEnabled && !GF.finishing, original => function(card, target) {
       const name = card && camps[card.camp], rule = cfg.effects[name];
       if (!card || GF.finishing) return original.apply(this, arguments);
@@ -284,22 +319,30 @@ JS_COMBAT_INSTALL = r"""
       const rate = changed && (name === 'wind' || ready(this, meta, card, rule)) ? probability(card, rule) : 0;
       const [field, value] = probabilityField(card, rate), before = card[field], oldCD = card.campVal2;
       const skills = changed ? skillCount(this, card) : 0;
+      const fixedNow = !!(GF.oneHit && GF.oneHitMode === 'fixed_attack');
+      const oldAttack = card.attack;
+      if (fixedNow) card.attack = Math.max(1, Number(GF.attackFixed) || 1);
       const seen = card.camp === 4 && cfg.repeat_ice ? this._iceFrozenThisFloor :
                    card.camp === 2 && cfg.repeat_earth ? this._earthSlowedThisFloor : null;
       const hadTarget = !!(seen && target && seen.has(target.id));
       if (hadTarget) seen.delete(target.id);
       if (changed) card[field] = value;
-      if (changed && name === 'wind') card.campVal2 = rule.cd;
+      if (changed && name === 'wind' && rule.cd >= 0) card.campVal2 = rule.cd;
       try { return original.apply(this, arguments); }
       finally {
         if (changed && skillCount(this, card) > skills) meta.triggered.set(card.cardInstanceId, meta.clock);
         if (changed) card[field] = before;
-        if (changed && name === 'wind') card.campVal2 = oldCD;
+        if (changed && name === 'wind' && rule.cd >= 0) card.campVal2 = oldCD;
+        if (fixedNow) card.attack = oldAttack;
         // 临时放行当前目标，关闭开关时仍保留其本关已经受过控制的历史。
         if (hadTarget) seen.add(target.id);
       }
     });
-    if (GF.finishing) holdAttacks(loop, meta);
+    if (GF.finishing) {
+      meta.endWarmup = !!GF.endWarmup;
+      if (meta.endWarmup) releaseAttacks(loop, meta);
+      else holdAttacks(loop, meta);
+    }
     else releaseAttacks(loop, meta);
   }
   function restore(loop) {
@@ -315,6 +358,7 @@ JS_COMBAT_INSTALL = r"""
     meta.methods.clear();
     meta.applied = {attack_speed: {enabled: false}, effects: {}};
     meta.version = -1;
+    meta.endWarmup = false;
     if (currentLoop === loop) currentLoop = null;
   }
   function snapshot() {

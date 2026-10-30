@@ -25,8 +25,10 @@ import tempfile
 import threading
 import traceback
 import datetime
+from urllib.parse import urlsplit
 from stage_timing import StageTimer, api_stage
-from diagnostics import DebugRecorder, JS_ENGINE_SNAPSHOT, safe_api_data
+from daily_tasks import DailyChallenge, JS_DAILY_TASK_QUERY
+from diagnostics import DebugRecorder, JS_ENGINE_SNAPSHOT, safe_api_data, safe_api_request_data
 from combat_controls import (JS_COMBAT_INSTALL, JS_COMBAT_SNAPSHOT, KillStats, ActivityWatch,
                              default_controls, normalize_controls, EFFECTS, EFFECT_LABELS)
 
@@ -316,8 +318,8 @@ JS_HP_WATCH = r"""
                             fullHp: 0,
                             battleT0: 0, maxRefillMs: 540000, capped: false,
                             oneHit: false, oneHitMode: 'full', oneHitProbability: 50,
-                            attackMultiplier: 2, oneHitKills: 0, oneHitWrapped: false,
-                            monitor: false, discover: false, endRequested: false, endApplied: false, finishing: false, endLoop: null,
+                            attackMultiplier: 2, attackFixed: 100000, oneHitKills: 0, oneHitWrapped: false,
+                            monitor: false, discover: false, endRequested: false, endApplied: false, finishing: false, endWarmup: false, endLoop: null,
                             intervalId: null, wrappedLoops: [],
                             scanCount: 0, scanInfo: null, diag: null, err: null, comp: ''};
   // 解析：ref.current 可能是 BattleLoop（直接含 coreHp）或 BattleManager（显示层，coreHp 在 .loop 里）
@@ -465,6 +467,11 @@ JS_HP_WATCH = r"""
       GF.hpGuard = false;
       GF.oneHit = false;
       GF.finishing = true;
+      const nextProjectileId = Number(loop._nextProjectileId);
+      // If this engine has not launched a projectile yet, let one native
+      // attack update pass after the end request.  This matters when the
+      // request arrives while the starter skill selection is still visible.
+      GF.endWarmup = !Number.isFinite(nextProjectileId) || nextProjectileId <= 0;
       if (window.__gfCombat) window.__gfCombat.sync(loop);
       wrapDamage(loop);
       const before = loop.coreHp;
@@ -589,12 +596,14 @@ JS_HP_CFG = r"""
   if (cfg && cfg.oneHit !== undefined) window.__GF.oneHit = !!cfg.oneHit;
   if (cfg && cfg.oneHitMode !== undefined) {
     const mode = String(cfg.oneHitMode || 'full');
-    window.__GF.oneHitMode = ['full', 'probability', 'multiplier'].indexOf(mode) >= 0 ? mode : 'full';
+    window.__GF.oneHitMode = ['full', 'probability', 'multiplier', 'fixed_attack'].indexOf(mode) >= 0 ? mode : 'full';
   }
   if (cfg && cfg.oneHitProbability !== undefined)
     window.__GF.oneHitProbability = Math.max(0, Math.min(100, Number(cfg.oneHitProbability) || 0));
   if (cfg && cfg.attackMultiplier !== undefined)
     window.__GF.attackMultiplier = Math.max(0.01, Number(cfg.attackMultiplier) || 1);
+  if (cfg && cfg.attackFixed !== undefined)
+    window.__GF.attackFixed = Math.max(1, Number(cfg.attackFixed) || 1);
   if (cfg && cfg.discover !== undefined) window.__GF.discover = !!cfg.discover;
   if (cfg && cfg.monitor !== undefined) window.__GF.monitor = !!cfg.monitor;
   if (cfg && window.__gfCombat) window.__gfCombat.configure(cfg.combat, cfg.monitorEpoch);
@@ -622,7 +631,7 @@ JS_HP_UNLOAD = r"""
 () => {
   const gf = window.__GF;
   if (!gf) return {ok: true, unloaded: false};
-  try { gf.enabled = false; gf.endRequested = false; gf.finishing = false; } catch (e) {}
+  try { gf.enabled = false; gf.endRequested = false; gf.finishing = false; gf.endWarmup = false; } catch (e) {}
   try { if (gf.intervalId) clearInterval(gf.intervalId); } catch (e) {}
   try { for (const loop of [...(gf.wrappedLoops || [])]) { if (typeof window.__gfRestoreLoop === 'function') window.__gfRestoreLoop(loop); } } catch (e) {}
   try { if (window.__GF_CREATED_REACT_HOOK__) delete window.__REACT_DEVTOOLS_GLOBAL_HOOK__; delete window.__GF_CREATED_REACT_HOOK__; } catch (e) {}
@@ -645,6 +654,7 @@ JS_HP_DRAIN = r"""
           oneHit: !!gf.oneHit, oneHitMode: gf.oneHitMode || 'full',
           oneHitProbability: Number(gf.oneHitProbability) || 0,
           attackMultiplier: Number(gf.attackMultiplier) || 1,
+          attackFixed: Number(gf.attackFixed) || 1,
           oneHitWrapped: !!gf.oneHitWrapped,
           oneHitKills: gf.oneHitKills || 0,
           endRequested: !!gf.endRequested, endApplied: !!gf.endApplied,
@@ -658,7 +668,7 @@ JS_HOOK = r"""
 (() => {
   if (window.__WM) return;
   const W = window.__WM = {panelInfo:null, battleInfo:null, stage:null, maxStage:0,
-                          freeNum:null, battleSkill:null, battleOver:false, last:null, respCount:0};
+                          freeNum:null, battleRound:null, battleSkill:null, battleOver:false, last:null, respCount:0};
   const pick = (url, j) => {
     try {
       const d = j && j.data || {};
@@ -667,6 +677,7 @@ JS_HOOK = r"""
       if (url.indexOf('basics/panelInfo') >= 0) W.panelInfo = j;
       if (url.indexOf('game/battleInfo') >= 0) W.battleInfo = j;
       if (d.userInfo && d.userInfo.freeNum != null) W.freeNum = d.userInfo.freeNum;
+      if (d.userInfo && d.userInfo.battleRound != null) W.battleRound = d.userInfo.battleRound;
       if (d.battleInfo && d.battleInfo.curStage != null) {
         W.stage = {curStage: d.battleInfo.curStage, curHp: d.battleInfo.baseHp, t: Date.now()};
         W.maxStage = Math.max(W.maxStage || 0, d.battleInfo.curStage);
@@ -752,7 +763,8 @@ JS_STATE = r"""
   }
 
   const w = window.__WM || {};
-  out.wm = {respCount: w.respCount || 0, freeNum: w.freeNum, maxStage: w.maxStage || 0,
+  out.wm = {respCount: w.respCount || 0, freeNum: w.freeNum, battleRound: w.battleRound,
+            maxStage: w.maxStage || 0,
             panelReady: !!w.panelInfo,
             stage: w.stage, battleOver: !!w.battleOver,
             nick: (w.panelInfo && w.panelInfo.data && w.panelInfo.data.userInfo && w.panelInfo.data.userInfo.nn) || '',
@@ -959,7 +971,7 @@ def score_skill_text(txt):
     return 300
 
 
-ONE_HIT_MODES = {"full", "probability", "multiplier"}
+ONE_HIT_MODES = {"full", "probability", "multiplier", "fixed_attack"}
 
 
 def normalize_one_hit_mode(mode):
@@ -967,12 +979,14 @@ def normalize_one_hit_mode(mode):
     return mode if mode in ONE_HIT_MODES else "full"
 
 
-def one_hit_mode_text(mode, probability=50.0, multiplier=2.0):
+def one_hit_mode_text(mode, probability=50.0, multiplier=2.0, attack_fixed=100000.0):
     mode = normalize_one_hit_mode(mode)
     if mode == "probability":
         return "概率 %.1f%%" % float(probability)
     if mode == "multiplier":
         return "攻击 %.2fx" % float(multiplier)
+    if mode == "fixed_attack":
+        return "固定攻击 %.0f" % float(attack_fixed)
     return "全额"
 
 
@@ -983,8 +997,8 @@ class GuardFishBot:
                  hp_guard=True, hp_threshold=5, coin_play=True, one_hit=False,
                  max_battle_seconds=MAX_BATTLE_SECONDS, stop_stage=0,
                  advance_stages=0, one_hit_mode="full",
-                 one_hit_probability=50.0, attack_multiplier=2.0, debug=False,
-                 pause_on_timeout=False, combat_controls=None):
+                 one_hit_probability=50.0, attack_multiplier=2.0, attack_fixed=100000.0,
+                 finish_fast=False, debug=False, pause_on_timeout=False, combat_controls=None):
         self.rid = str(rid)
         self.rounds = int(rounds)
         self.gap_min = float(gap_min or 0)
@@ -998,6 +1012,8 @@ class GuardFishBot:
         self.one_hit_mode = normalize_one_hit_mode(one_hit_mode)
         self.one_hit_probability = max(0.0, min(float(one_hit_probability or 0), 100.0))
         self.attack_multiplier = max(float(attack_multiplier or 1.0), 0.01)
+        self.attack_fixed = max(float(attack_fixed or 1.0), 1.0)
+        self.finish_fast = bool(finish_fast)
         self.max_battle_seconds = max(float(max_battle_seconds or MAX_BATTLE_SECONDS), 1.0)
         self.stop_stage = max(int(stop_stage or 0), 0)       # 绝对关卡目标，0=关闭
         self.advance_stages = max(int(advance_stages or 0), 0)  # 从起始关推进的关卡数，0=关闭
@@ -1050,11 +1066,14 @@ class GuardFishBot:
         self._server_reject_ts = 0
         self._report_errs = 0
         self._date = datetime.date.today().strftime("%Y%m%d")
+        self._daily = DailyChallenge()
+        self._daily_next_query = 0.0
 
         # 对外可见的状态（GUI 读取）
         self.status = {
             "state": "空闲", "round": 0, "rounds": self.rounds, "rounds_done": 0, "stage": 0, "hp": 0,
-            "freeNum": None, "maxStage": 0, "weekRank": 0, "nick": "", "coin": None,
+            "freeNum": None, "battleRound": None, "maxStage": 0, "weekRank": 0, "nick": "", "coin": None,
+            "daily_count": None, "daily_target": 30,
         }
 
     # -------- 日志 --------
@@ -1063,7 +1082,8 @@ class GuardFishBot:
 
     def set_runtime_controls(self, hp_guard=None, one_hit=None, hp_threshold=None,
                              one_hit_mode=None, one_hit_probability=None,
-                             attack_multiplier=None, combat_controls=None):
+                             attack_multiplier=None, attack_fixed=None, finish_fast=None,
+                             combat_controls=None):
         """更新运行中的回血/秒杀开关；实际页面操作由机器人线程执行。"""
         with self._control_lock:
             if hp_guard is not None:
@@ -1078,6 +1098,10 @@ class GuardFishBot:
                 self.one_hit_probability = max(0.0, min(float(one_hit_probability), 100.0))
             if attack_multiplier is not None:
                 self.attack_multiplier = max(float(attack_multiplier), 0.01)
+            if attack_fixed is not None:
+                self.attack_fixed = max(float(attack_fixed), 1.0)
+            if finish_fast is not None:
+                self.finish_fast = bool(finish_fast)
             if combat_controls is not None:
                 self.combat_controls = normalize_controls(combat_controls, self.combat_controls)
             self._runtime_pending = True
@@ -1196,6 +1220,9 @@ class GuardFishBot:
             self._log("注入 hook 失败：%s" % str(e)[:120], "warn")
         try:
             self._page.on("response", self._on_response)
+            if self.debug:
+                # 只记录战斗上报类请求的脱敏结构；普通版不安装请求监听。
+                self._page.on("request", self._on_request)
         except Exception:
             pass
         # 关闭付费「不再提示」标记（安全兜底）
@@ -1249,6 +1276,7 @@ class GuardFishBot:
             one_hit_mode = normalize_one_hit_mode(self.one_hit_mode)
             one_hit_probability = max(0.0, min(float(self.one_hit_probability), 100.0))
             attack_multiplier = max(float(self.attack_multiplier), 0.01)
+            attack_fixed = max(float(self.attack_fixed), 1.0)
             combat = self.combat_controls
             pending = bool(self._runtime_pending)
             natural_end = bool(self._natural_end_requested)
@@ -1264,6 +1292,7 @@ class GuardFishBot:
                         "oneHitMode": one_hit_mode,
                         "oneHitProbability": one_hit_probability,
                         "attackMultiplier": attack_multiplier,
+                        "attackFixed": attack_fixed,
                         "discover": True, "monitor": True, "monitorEpoch": self._runtime_epoch,
                         "combat": default_controls(), "maxRefillMs": self.max_battle_seconds * 1000,
                     })
@@ -1272,7 +1301,7 @@ class GuardFishBot:
                         with self._control_lock:
                             self._natural_end_sent = True
                         if r.get("ok"):
-                            self._log("已将基地降到 1 血，暂停新攻击并关闭强化；在途伤害限制为 1–100，等待自然结算", "warn")
+                            self._log("已将基地降到 1 血并关闭强化；未发射过的引擎先放行一次原生攻击，再暂停新攻击，伤害限制为 1–100", "warn")
                         else:
                             self._log("已请求自然结束，等待识别战斗引擎", "warn")
                         return r
@@ -1287,13 +1316,14 @@ class GuardFishBot:
         if not self._install_runtime_script():
             return None
         desired = (hp_guard, one_hit, threshold, one_hit_mode, one_hit_probability,
-                   attack_multiplier, combat)
+                   attack_multiplier, attack_fixed, combat)
         if pending or force or self._runtime_applied != desired:
             try:
                 r = self._page.evaluate(JS_HP_CFG, {
                     "hpGuard": hp_guard, "oneHit": one_hit, "threshold": threshold,
                     "oneHitMode": one_hit_mode, "oneHitProbability": one_hit_probability,
-                    "attackMultiplier": attack_multiplier, "combat": combat,
+                    "attackMultiplier": attack_multiplier, "attackFixed": attack_fixed,
+                    "combat": combat,
                     "monitor": True, "monitorEpoch": self._runtime_epoch,
                     "discover": False, "maxRefillMs": self.max_battle_seconds * 1000,
                 })
@@ -1302,13 +1332,16 @@ class GuardFishBot:
                 self._runtime_applied = desired
                 self._log("实时配置已同步：回血=%s｜伤害=%s｜攻速=%s｜分系覆盖=%s"
                           % ("开" if hp_guard else "关",
-                             one_hit_mode_text(one_hit_mode, one_hit_probability, attack_multiplier) if one_hit else "关",
+                             one_hit_mode_text(one_hit_mode, one_hit_probability, attack_multiplier, attack_fixed) if one_hit else "关",
                              ("固定 %.3g 秒" % combat["attack_speed"]["fixed"]
                               if combat["attack_speed"]["mode"] == "fixed" else
                               "倍率 %.3g" % combat["attack_speed"]["multiplier"])
                              if combat["attack_speed"]["enabled"] else "关",
                              "/".join(EFFECT_LABELS[k] for k, v in combat["effects"].items() if v["enabled"]) or "关"), "dim")
-                self._debug_write("runtime_config", combat=combat, hp_guard=hp_guard, one_hit=one_hit)
+                self._debug_write("runtime_config", combat=combat, hp_guard=hp_guard, one_hit=one_hit,
+                                  one_hit_mode=one_hit_mode, one_hit_probability=one_hit_probability,
+                                  attack_multiplier=attack_multiplier, attack_fixed=attack_fixed,
+                                  finish_fast=self.finish_fast)
                 return r
             except Exception as e:
                 self._log("同步战斗设置失败：%s" % str(e)[:120], "warn")
@@ -1436,6 +1469,29 @@ class GuardFishBot:
         return []
 
     # -------- 抓包 --------
+    def _on_request(self, req):
+        """Debug 专用：记录战斗上报请求的脱敏字段，避免只看到响应无法判断提交内容。"""
+        try:
+            if not self.debug:
+                return
+            url = req.url
+            if "/japi/revenuenc/" not in url or "/actgame/" not in url:
+                return
+            api = url.split("/actgame/")[-1].split("?")[0]
+            if api not in {"game/battleStart", "game/stageStart", "game/stageEventReport",
+                           "game/stageEnd", "game/nextStage", "game/battleSkillChoice"}:
+                return
+            body = req.post_data or ""
+            data = safe_api_request_data(body)
+            query = safe_api_request_data(urlsplit(url).query)
+            self._debug_write("api_request", api=api, method=req.method,
+                              monotonic_s=time.monotonic(), bytes=len(body.encode('utf-8')),
+                              query=query, data=data)
+            self._api_write({"t": time.strftime("%H:%M:%S"), "direction": "request",
+                             "api": api, "method": req.method, "query": query, "body": data})
+        except Exception:
+            pass
+
     def _on_response(self, resp):
         try:
             url = resp.url
@@ -1450,9 +1506,12 @@ class GuardFishBot:
             if body:
                 try:
                     j = json.loads(body)
+                    if api == "userTask/panelInfo":
+                        self._daily.update_status(j)
+                        self._sync_daily_status()
                     if self._stage_timer is not None and 200 <= resp.status < 300:
                         self._stage_timer.on_api(api, j, received_mono, received_wall)
-                    if self.debug and api != "game/stageEventReport":
+                    if self.debug:
                         self._debug_write("api_response", api=api, status=resp.status,
                                           monotonic_s=received_mono, stage=api_stage(j),
                                           data=safe_api_data(j))
@@ -1518,6 +1577,34 @@ class GuardFishBot:
             pass
 
     # -------- 页面动作 --------
+    def _sync_daily_status(self):
+        progress = self._daily.progress()
+        self.status['daily_count'] = progress['count'] if progress else None
+        if progress:
+            self.status['daily_target'] = progress['target']
+
+    def _refresh_daily_progress(self, force=False):
+        if self._page is None or self._paused or self._stop.is_set():
+            return
+        if self._natural_end_requested and not force:
+            return
+        now = time.monotonic()
+        if not force and now < self._daily_next_query:
+            return
+        self._daily_next_query = now + 60
+        try:
+            result = self._page.evaluate(JS_DAILY_TASK_QUERY,
+                                         {'rid': self.rid, 'config': not bool(self._daily.tasks)})
+            if not isinstance(result, dict):
+                return
+            self._daily.update_config(result.get('config'))
+            self._daily.update_status(result.get('tasks'))
+            self._sync_daily_status()
+            self._debug_write('daily_task_progress', progress=self._daily.progress(),
+                              battle_round=self.status.get('battleRound'))
+        except Exception as exc:
+            self._debug_write('daily_task_query_error', error_type=type(exc).__name__)
+
     def _state(self):
         try:
             st = self._page.evaluate(JS_STATE)
@@ -1537,7 +1624,10 @@ class GuardFishBot:
             wm = st.get("wm") or {}
             self.status["stage"] = (wm.get("stage") or {}).get("curStage") or self.status["stage"]
             self.status["hp"] = (wm.get("stage") or {}).get("curHp", 0)
-            self.status["freeNum"] = wm.get("freeNum")
+            if wm.get("freeNum") is not None:
+                self.status["freeNum"] = wm.get("freeNum")
+            if wm.get("battleRound") is not None:
+                self.status["battleRound"] = wm.get("battleRound")
             self.status["maxStage"] = wm.get("maxStage") or self.status["maxStage"]
             self.status["weekRank"] = wm.get("weekRank") or self.status["weekRank"]
             self.status["nick"] = wm.get("nick") or self.status["nick"]
@@ -1855,7 +1945,8 @@ class GuardFishBot:
         ensure_dirs()
         self._debug_write("run_start", hp_guard=self.hp_guard, one_hit=self.one_hit,
                           one_hit_mode=self.one_hit_mode, one_hit_probability=self.one_hit_probability,
-                          attack_multiplier=self.attack_multiplier, rounds=self.rounds,
+                          attack_multiplier=self.attack_multiplier, attack_fixed=self.attack_fixed,
+                          finish_fast=self.finish_fast, rounds=self.rounds,
                           stop_stage=self.stop_stage, advance_stages=self.advance_stages,
                           max_battle_seconds=self.max_battle_seconds)
         try:
@@ -1863,6 +1954,7 @@ class GuardFishBot:
             if not self._goto_game():
                 self.status["state"] = "未登录"
                 return
+            self._refresh_daily_progress(force=True)
 
             while True:
                 if self._pause_requested and self._is_lobby(self._state() or {}):
@@ -2037,6 +2129,10 @@ class GuardFishBot:
                 return None
             skills_chosen = list(info2.get("skills") or [])
 
+        if self.finish_fast:
+            self.request_natural_end("尽快完成")
+        self._refresh_daily_progress(force=True)
+
         # 3) 战斗循环
         self.status["state"] = "战斗中"
         self._battle_active = True
@@ -2065,12 +2161,15 @@ class GuardFishBot:
             elapsed = time.time() - t_battle0
             if self._pause_requested:
                 self.request_natural_end("暂时停止")
+            elif self.finish_fast:
+                self.request_natural_end("尽快完成")
             with self._control_lock:
                 natural_requested = bool(self._natural_end_requested)
             if end_started is None and not natural_requested and elapsed >= self.max_battle_seconds:
                 self.request_natural_end("达到单场监控时限 %.1f 分钟" % (self.max_battle_seconds / 60.0))
                 natural_requested = True
             self._apply_runtime_controls()
+            self._refresh_daily_progress()
             if end_started is None and natural_requested:
                 end_started = time.time()
                 self.status["state"] = "等待结算"
@@ -2114,7 +2213,8 @@ class GuardFishBot:
                         "开" if gf.get("hpGuard") else "关",
                         (one_hit_mode_text(gf.get("oneHitMode"),
                                            gf.get("oneHitProbability", 50),
-                                           gf.get("attackMultiplier", 2))
+                                           gf.get("attackMultiplier", 2),
+                                           gf.get("attackFixed", 100000))
                          if gf.get("oneHit") else "关"))
                     self._log("战斗引擎已识别（%s）｜%s" %
                               (gf.get("comp") or "engine", modes),
@@ -2297,6 +2397,8 @@ class GuardFishBot:
                 break
 
         final = self._state() or {}
+        self._sync_status(final)
+        self._refresh_daily_progress(force=True)
         fwm = (final.get("wm") or {})
         fstage = (fwm.get("stage") or {})
         with self._lock:
@@ -2476,12 +2578,16 @@ def main(default_debug=False):
     ap.add_argument("--hp-threshold", type=int, default=5, help="回血阈值（血量低于该值回满，默认 5）")
     ap.add_argument("--no-coin", action="store_true", help="免费用尽后不用银币续打（默认会用，银币为免费获取）")
     ap.add_argument("--one-hit", action="store_true", help="秒杀模式：我方卡牌伤害直接击杀怪物")
-    ap.add_argument("--one-hit-mode", choices=("full", "probability", "multiplier"), default="full",
-                    help="秒杀策略：full=全额，probability=概率，multiplier=攻击倍率")
+    ap.add_argument("--one-hit-mode", choices=("full", "probability", "multiplier", "fixed_attack"), default="full",
+                    help="秒杀策略：full=全额，probability=概率，multiplier=攻击倍率，fixed_attack=固定攻击力")
     ap.add_argument("--one-hit-probability", type=float, default=50.0,
                     help="概率秒杀触发概率（0~100，默认 50）")
     ap.add_argument("--attack-multiplier", type=float, default=2.0,
                     help="攻击倍率策略的伤害倍数（默认 2）")
+    ap.add_argument("--attack-fixed", type=float, default=100000.0,
+                    help="固定攻击力策略的攻击力（默认 100000）")
+    ap.add_argument("--finish-fast", action="store_true",
+                    help="每场开始后立即请求正常收尾，仍继续推进场次")
     speed_group = ap.add_mutually_exclusive_group()
     speed_group.add_argument("--attack-speed-multiplier", type=float,
                              help="独立攻速倍率；-2=原速的 1/2，0=原速")
@@ -2525,6 +2631,8 @@ def main(default_debug=False):
         ap.error("--one-hit-probability 必须在 0~100 之间")
     if args.attack_multiplier <= 0:
         ap.error("--attack-multiplier 必须大于 0")
+    if args.attack_fixed < 1:
+        ap.error("--attack-fixed 必须大于等于 1")
 
     if args.selftest:
         selftest()
@@ -2553,7 +2661,9 @@ def main(default_debug=False):
                            advance_stages=args.advance_stages,
                            one_hit_mode=args.one_hit_mode,
                            one_hit_probability=args.one_hit_probability,
-                           attack_multiplier=args.attack_multiplier, debug=args.debug,
+                           attack_multiplier=args.attack_multiplier,
+                           attack_fixed=args.attack_fixed, finish_fast=args.finish_fast,
+                           debug=args.debug,
                            combat_controls=combat)
         bot.add_log_sink(sink)
         start_desc = "命令行挂机启动：房间=%s 场数=%d" % (args.rid, args.rounds)
@@ -2561,7 +2671,10 @@ def main(default_debug=False):
             start_desc += " [headless]"
         if args.one_hit:
             start_desc += " [秒杀模式=%s]" % one_hit_mode_text(
-                args.one_hit_mode, args.one_hit_probability, args.attack_multiplier)
+                args.one_hit_mode, args.one_hit_probability, args.attack_multiplier,
+                args.attack_fixed)
+        if args.finish_fast:
+            start_desc += " [尽快完成]"
         bot._log(start_desc)
         bot.start()
         try:
@@ -2578,9 +2691,11 @@ def main(default_debug=False):
     print("  --login          打开浏览器登录斗鱼（首次/掉登录后）")
     print("  --run            命令行挂机（--rounds N --rid 12306 --headless）")
     print("  --one-hit        秒杀模式：我方卡牌伤害直接击杀怪物")
-    print("  --one-hit-mode full|probability|multiplier  秒杀策略")
+    print("  --one-hit-mode full|probability|multiplier|fixed_attack  秒杀策略")
     print("  --one-hit-probability N  概率秒杀触发概率（0~100）")
     print("  --attack-multiplier N  攻击倍率策略的伤害倍数")
+    print("  --attack-fixed N  固定攻击力策略的攻击力")
+    print("  --finish-fast     每场开始后立即正常收尾，场次继续推进")
     print("  --no-hp          关闭血量低于阈值自动回满")
     print("  --no-coin        免费用尽后不用银币续打")
     print("  --max-battle-minutes N  单场最长监控时间（分钟）")

@@ -5,9 +5,10 @@ import os
 import platform
 import re
 import sys
+from urllib.parse import parse_qs
 
 
-_PRIVATE = re.compile(r"cookie|token|auth|secret|password|user|nickname|account|session|uid|rid|url|header|storage", re.I)
+_PRIVATE = re.compile(r"cookie|token|auth|secret|password|user|nickname|account|session|uid|rid|url|header|storage|salt|signature|^sign$", re.I)
 
 
 def safe_api_data(value, depth=0):
@@ -26,6 +27,54 @@ def safe_api_data(value, depth=0):
     return "[unsupported]"
 
 
+def safe_api_request_data(body):
+    """解析接口请求体，只保留字段结构/数值，绝不落盘认证和身份原文。"""
+    def clean(value, depth=0, key=""):
+        if _PRIVATE.search(key):
+            return "[redacted]"
+        if depth > 12:
+            return "[depth limit]"
+        if isinstance(value, dict):
+            return {str(k): clean(v, depth + 1, str(k)) for k, v in list(value.items())[:200]}
+        if isinstance(value, list):
+            return {"length": len(value), "sample": [clean(v, depth + 1) for v in value[:200]]}
+        if isinstance(value, str):
+            # Reports may contain JSON text inside form fields or a JSON
+            # envelope.  Preserve that structure instead of only its length.
+            try:
+                parsed = json.loads(value)
+                if not isinstance(parsed, str):
+                    return clean(parsed, depth + 1)
+            except (TypeError, ValueError):
+                pass
+            if key in ("type", "eventType", "event", "kind", "phaseType") and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,39}", value):
+                return value
+            return "[text:%d]" % len(value)
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        return "[unsupported]"
+
+    if body is None:
+        return None
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", "replace")
+    body = str(body)
+    if not body:
+        return {"length": 0, "format": "empty"}
+    try:
+        return {"format": "json", "data": clean(json.loads(body))}
+    except (TypeError, ValueError):
+        pass
+    try:
+        parsed = parse_qs(body, keep_blank_values=True)
+        if parsed:
+            decoded = {key: values[0] if len(values) == 1 else values for key, values in parsed.items()}
+            return {"format": "form", "data": clean(decoded)}
+    except (TypeError, ValueError):
+        pass
+    return {"format": "unparsed", "length": len(body)}
+
+
 class DebugRecorder:
     def __init__(self, directory, version):
         os.makedirs(directory, exist_ok=True)
@@ -33,7 +82,7 @@ class DebugRecorder:
         self.path = os.path.join(directory, "debug_%s.jsonl" % stamp)
         self._file = open(self.path, "x", encoding="utf-8")
         self.write("session", version=version, python=sys.version.split()[0],
-                   platform=platform.system(), schema_version=1)
+                   platform=platform.system(), schema_version=2)
 
     def write(self, kind, **data):
         self._file.write(json.dumps({"at": datetime.datetime.now().isoformat(timespec="milliseconds"),

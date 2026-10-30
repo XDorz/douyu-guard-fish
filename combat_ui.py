@@ -1,4 +1,4 @@
-"""左对齐的实时攻速/分系编辑器，统一处理模式缓存、边界和输入防抖。"""
+"""左对齐的实时攻速/分系编辑器，数字在失焦或回车后提交。"""
 import math
 import tkinter as tk
 from tkinter import ttk
@@ -16,8 +16,9 @@ class CombatWidgets:
         self.current = default_controls()
         self.loading = False
         self.job = None
-        for var in (self.repeat_ice, self.repeat_earth):
-            var.trace_add('write', self._schedule)
+        # 数字输入只在回车、失焦或点击其它区域时提交，避免输入 100
+        # 时依次把 1、10、100 发送到游戏。
+        self.root.bind_all('<Button-1>', self._click_outside_editor, add='+')
 
     def _group(self, key, parent, title):
         group = {
@@ -49,17 +50,27 @@ class CombatWidgets:
         group['unit'] = ttk.Label(second, text='倍', font=self.small_font)
         group['unit'].pack(side='left')
         if key != 'attack_speed':
-            group['cd'] = tk.StringVar(value='8' if key == 'wind' else '0')
+            group['cd'] = tk.StringVar(value='-1')
             ttk.Label(second, text='CD', font=self.small_font).pack(side='left', padx=(12, 4))
             cd = ttk.Entry(second, textvariable=group['cd'], width=5, font=self.font)
             cd.pack(side='left')
             cd.bind('<Return>', lambda _e: self.flush())
             cd.bind('<FocusOut>', lambda _e: self.flush())
             ttk.Label(second, text='秒', font=self.small_font).pack(side='left', padx=(3, 0))
-            group['cd'].trace_add('write', self._schedule)
-        group['value'].trace_add('write', self._schedule)
-        group['enabled'].trace_add('write', self._schedule)
         return first
+
+    def _click_outside_editor(self, event):
+        if self.loading:
+            return
+        cls = event.widget.winfo_class()
+        if cls not in ('Entry', 'TEntry', 'Combobox', 'TCombobox'):
+            self.flush()
+        if cls in ('Tk', 'Toplevel', 'Frame', 'TFrame', 'Label', 'TLabel',
+                   'Labelframe', 'TLabelframe', 'PanedWindow', 'TPanedwindow'):
+            try:
+                self.root.focus_set()
+            except tk.TclError:
+                pass
 
     def build_speed(self, parent):
         speed = ttk.Frame(parent)
@@ -77,8 +88,8 @@ class CombatWidgets:
             frame = ttk.Frame(panel)
             frame.pack(anchor='w', fill='x', pady=(0, 12))
             self._group(name, frame, EFFECT_LABELS[name])
-        notes = ttk.Label(panel, text='固定概率对同系所有卡生效。\n倍率按各卡原有概率计算。\n风系共享 CD，其余按卡计时。\nCD 0 表示不加额外冷却。\n固定攻速值为攻击间隔。\n负倍率减速，0 为原速。\n间隔与 CD 均为游戏内秒。',
-                          font=self.small_font, foreground='#666', justify='left', anchor='nw', wraplength=290)
+        notes = ttk.Label(panel, text='固定概率对同系所有卡生效。\n倍率按各卡原有概率计算。\n风系共享 CD，其余按卡计时。\nCD -1 原速；风最低 0.5 秒，\n其余最低 0，越界自动修正。\n固定攻速值为攻击间隔。\n负倍率减速，0 为原速。\n间隔与 CD 均为游戏内秒。\n数字失焦或回车后应用。',
+                          font=self.small_font, foreground='#666', justify='left', anchor='nw', wraplength=235)
         notes.pack(anchor='nw', fill='x')
 
     def _schedule(self, *_args):

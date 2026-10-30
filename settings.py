@@ -11,7 +11,8 @@ DEFAULTS = {
     "rid": "12306", "rounds": "0", "gap_min": "5", "gap_max": "15",
     "hp_guard": True, "hp_threshold": "5", "coin_play": True,
     "one_hit": False, "one_hit_mode": "full", "one_hit_probability": "50",
-    "attack_multiplier": "2", "headless": False,
+    "attack_multiplier": "2", "attack_fixed": "100000", "finish_fast": False,
+    "headless": False,
     "stop_stage": "0", "advance_stages": "0", "max_minutes": "13",
     "combat": default_controls(),
 }
@@ -21,6 +22,7 @@ LIMITS = {
     "stop_stage": (0, None, True), "advance_stages": (0, None, True),
     "max_minutes": (0.001, None, False),
     "one_hit_probability": (0, 100, False), "attack_multiplier": (0.01, None, False),
+    "attack_fixed": (1, None, False),
 }
 
 
@@ -49,7 +51,7 @@ def normalize(values, base=None):
             except (TypeError, ValueError, OverflowError):
                 pass
         elif key == "one_hit_mode":
-            if value in ("full", "probability", "multiplier"):
+            if value in ("full", "probability", "multiplier", "fixed_attack"):
                 result[key] = value
         elif key == "rid" and isinstance(value, str) and value.strip():
             result[key] = value.strip()[:64]

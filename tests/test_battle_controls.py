@@ -167,6 +167,23 @@ class BattleControlTests(unittest.TestCase):
         self.assertTrue(b._pause_requested, 'run loop must pause after recording this result')
         b._close_browser.assert_not_called()
 
+    def test_finish_fast_ends_each_round_without_stopping_task(self):
+        clock = FakeClock()
+        b = self.battle_harness(clock, rounds=3, finish_fast=True)
+
+        def state():
+            lobby = b._natural_end_requested
+            return {'inBattle': not lobby, 'canChallenge': lobby,
+                    'wm': {'stage': {'curStage': 121, 'curHp': 20}}}
+        b._state = Mock(side_effect=state)
+        with patch('bot.ensure_dirs'), patch('bot.time.time', clock.time), patch('bot.time.sleep', clock.sleep):
+            b._run()
+        self.assertEqual(b.rounds_done, 3)
+        self.assertEqual(b._try_start_battle.call_count, 3)
+        self.assertEqual(b._battle_write.call_count, 3)
+        self.assertEqual(b._natural_end_reason, '尽快完成')
+        b._page.reload.assert_not_called()
+
     def test_reward_modal_is_not_a_completed_battle_and_result_waits_for_lobby(self):
         clock = FakeClock()
         b = self.battle_harness(clock)

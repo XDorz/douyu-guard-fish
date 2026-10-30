@@ -1,5 +1,6 @@
 import os
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -30,10 +31,12 @@ class GuiConfigTests(unittest.TestCase):
                 w._mode_changed('wind')
                 wind['value'].set('37.5')
                 wind['cd'].set('-1')
+                self.assertNotEqual(app.bot.combat_controls['effects']['wind']['probability'], 37.5,
+                                    'typing must not apply each intermediate value')
                 w.repeat_ice.set(True)
                 w.repeat_earth.set(True)
-                w.flush()
-                self.assertEqual(wind['cd'].get(), '0.5')
+                w._click_outside_editor(SimpleNamespace(widget=app.text))
+                self.assertEqual(wind['cd'].get(), '-1')
                 self.assertEqual(app.bot.combat_controls['attack_speed']['multiplier'], -2)
                 self.assertEqual(app.bot.combat_controls['effects']['wind']['probability'], 37.5)
                 self.assertTrue(app.bot.combat_controls['repeat_ice'])
@@ -51,7 +54,7 @@ class GuiConfigTests(unittest.TestCase):
                 try:
                     self.assertEqual(w.groups['attack_speed']['value'].get(), '-2')
                     self.assertEqual(w.groups['wind']['value'].get(), '1.5')
-                    self.assertEqual(w.groups['wind']['cd'].get(), '0.5')
+                    self.assertEqual(w.groups['wind']['cd'].get(), '-1')
                     self.assertTrue(w.repeat_ice.get() and w.repeat_earth.get())
                     w.groups['wind']['mode'].set('固定')
                     w._mode_changed('wind')
@@ -79,16 +82,22 @@ class GuiConfigTests(unittest.TestCase):
                     self.assertTrue(b._pause_requested)
                     self.assertEqual(str(app.pause_btn['state']), 'disabled')
                     b.rounds_done = 1
-                    b.status.update(rounds_done=1, round=1, state='已暂停')
+                    b.status.update(rounds_done=1, round=1, state='已暂停', freeNum=6,
+                                    battleRound=28, daily_count=28, daily_target=30)
                     b._paused = True
                     app._refresh_run_state()
                     self.assertEqual(app.pause_btn['text'], '恢复战斗')
                     self.assertIn('已完成 1/9', app.status.get())
+                    self.assertIn('免费剩余 6｜今日场次 28/30', app.status.get())
                     app.pause_btn.invoke()
                     self.assertFalse(b._pause_requested)
                     self.assertTrue(b._pause_wakeup.is_set())
                     self.assertIs(app.bot, b)
                     self.assertEqual(b.rounds_done, 1)
+                    app.running = False
+                    b.status['state'] = '已结束'
+                    app._on_finished()
+                    self.assertIn('今日场次 28/30', app.status.get(), 'keep the daily count after stopping')
                 finally:
                     root.update_idletasks()
                     app.running = False
@@ -114,6 +123,10 @@ class GuiConfigTests(unittest.TestCase):
                 app.one_hit_mode.set("攻击倍率")
                 app._one_hit_mode_changed()
                 app.one_hit_value.set("2.5")
+                app.finish_fast_var.set(True)
+                app.one_hit_mode.set("攻击力固定")
+                app._one_hit_mode_changed()
+                app.one_hit_value.set("4321")
                 root.update_idletasks()
                 app.on_close()
 
@@ -125,15 +138,20 @@ class GuiConfigTests(unittest.TestCase):
                     self.assertEqual(app.advance_stages.get(), "15")
                     self.assertFalse(app.hp_var.get())
                     self.assertTrue(app.one_hit_var.get())
-                    self.assertEqual(app.one_hit_value.get(), "2.5")
-                    self.assertEqual(app._one_hit_mode_key(), "multiplier")
+                    self.assertEqual(app.one_hit_value.get(), "4321")
+                    self.assertEqual(app._one_hit_mode_key(), "fixed_attack")
+                    self.assertTrue(app.finish_fast_var.get())
                     app.one_hit_mode.set("概率秒杀")
                     app._one_hit_mode_changed()
                     self.assertEqual(app.one_hit_value.get(), "37.5")
                     app.one_hit_mode.set("攻击倍率")
                     app._one_hit_mode_changed()
+                    self.assertEqual(app.one_hit_value.get(), "2.5")
+                    app.one_hit_mode.set("攻击力固定")
+                    app._one_hit_mode_changed()
                     app.on_close()
                 self.assertEqual(settings.load(path)[0]["attack_multiplier"], "2.5")
+                self.assertEqual(settings.load(path)[0]["attack_fixed"], "4321")
 
 
 if __name__ == "__main__":

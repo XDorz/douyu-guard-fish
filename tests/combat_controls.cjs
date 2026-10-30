@@ -32,7 +32,7 @@ class Loop {
       if (this.cardCooldowns[i] > 0) continue;
       const c = this.cards[i], id = 'proj-' + this._nextProjectileId;
       const crit = c.camp === 3 && this.random() < c.attrVal + c.campVal1;
-      this.pendingHits.set(id, {card: c, isCrit: crit});
+      this.pendingHits.set(id, {card: c, attackValue: c.attack, isCrit: crit});
       this.callbacks.onProjectileLaunched(c.cardInstanceId, 'enemy', c.camp, id);
       this._nextProjectileId++;
       this.cardCooldowns[i] = Math.max(.2, c.attackSpeed / this._resolveAttackSpeedMul(c.camp) / 1000);
@@ -161,6 +161,12 @@ function harness() {
   l._applyProjectileHit(l.cards[1], h.enemy('fourth'), 1, true, false);
   assert.deepEqual(l.rates.slice(-2).map(r => r[1]), [1, .2]);
   assert.equal(l.windRowCooldownMs, 500, 'probability multiplier must not scale CD');
+  l.windRowCooldownMs = 4000;
+  cfg.effects.wind.cd = -1; h.configure(cfg);
+  assert.equal(l.windRowCooldownMs, 4000, '-1 must leave current native cooldown intact');
+  l.windRowCooldownMs = 0;
+  l._applyProjectileHit(l.cards[0], h.enemy('native-cd'), 1, true, false);
+  assert.equal(l.windRowCooldownMs, 8000, '-1 must use native card CD');
   h.configure(defaults());
   assert.equal(l._applyProjectileHit, Loop.prototype._applyProjectileHit);
 }
@@ -199,6 +205,43 @@ for (const name of ['thunder', 'ice']) {
   assert.equal(l.shots.filter(s => s.card.camp === 3).at(-1).isCrit, true);
   h.configure(defaults());
   assert.equal(l._updateCardAttacks, Loop.prototype._updateCardAttacks);
+}
+
+// A fixed-attack strategy changes the native card only for the attack/hit
+// call and restores it immediately afterwards.
+{
+  const h = harness(), l = h.loop, cfg = defaults();
+  h.run('cfg', {monitor: true, monitorEpoch: 1, hpGuard: false, oneHit: true,
+                oneHitMode: 'fixed_attack', attackFixed: 77, combat: cfg});
+  h.tick(); l.cardCooldowns.fill(0); l._updateCardAttacks(.1);
+  assert.equal(l.shots.at(-1).attackValue, 77);
+  assert.ok(l.cards.every(c => c.attack === 50), 'fixed attack must be restored');
+  const enemy = h.enemy();
+  l._dealDamage(enemy, 77);
+  assert.equal(enemy.currentHp, 99923, 'fixed attack must not fall through to full one-hit damage');
+  h.run('unload');
+}
+
+// If ending is requested before the first projectile, one native update is
+// allowed before attacks are held, even if the native cooldown is still active.
+{
+  const h = harness(), l = h.loop;
+  l.cardCooldowns.fill(.3);
+  h.run('end');
+  l._updateCardAttacks(.1);
+  assert.equal(l._nextProjectileId, 0);
+  h.tick(); l._updateCardAttacks(.3);
+  const fired = l._nextProjectileId;
+  assert.ok(fired > 0, 'ending warmup should allow one native attack update');
+  l._updateCardAttacks(.1);
+  assert.equal(l._nextProjectileId, fired, 'ending must hold attacks after warmup');
+  const next = new Loop(122); next.cardCooldowns.fill(.3); h.ref.current.loop = next;
+  h.tick(); next._updateCardAttacks(.4);
+  assert.ok(next._nextProjectileId > 0, 'new engine must release any pre-warmup hold');
+  const nextFired = next._nextProjectileId;
+  next._updateCardAttacks(181);
+  assert.equal(next._nextProjectileId, nextFired);
+  h.run('unload');
 }
 
 // Repeated control only bypasses the current target check; disabling preserves history.

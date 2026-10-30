@@ -7,11 +7,39 @@ import unittest
 from unittest.mock import patch
 
 import bot
-from diagnostics import DebugRecorder, JS_ENGINE_SNAPSHOT, safe_api_data
+from diagnostics import DebugRecorder, JS_ENGINE_SNAPSHOT, safe_api_data, safe_api_request_data
 from stage_timing import StageTimer
 
 
 class DiagnosticsTests(unittest.TestCase):
+    def test_request_capture_keeps_report_shape_without_identity_values(self):
+        data = safe_api_request_data(json.dumps({
+            "battleId": 123, "stage": 121, "cardStats": [{"cid": 7, "skills": 3}],
+            "battleToken": "private-token", "uid": 99,
+        }))
+        self.assertEqual(data["format"], "json")
+        self.assertEqual(data["data"]["stage"], 121)
+        self.assertEqual(data["data"]["cardStats"]["length"], 1)
+        self.assertNotIn("private-token", json.dumps(data))
+        self.assertNotIn("99", json.dumps(data))
+
+    def test_form_request_capture_decodes_nested_json(self):
+        data = safe_api_request_data(
+            "payload=%7B%22stage%22%3A121%2C%22kills%22%3A4%7D&uid=99")
+        self.assertEqual(data["format"], "form")
+        self.assertEqual(data["data"]["payload"]["stage"], 121)
+        self.assertEqual(data["data"]["payload"]["kills"], 4)
+        self.assertNotIn("99", json.dumps(data))
+
+    def test_request_capture_decodes_real_stage_end_stats(self):
+        report = {"result": 2, "curHp": 0, "stat": json.dumps({"totalDmg": 6000000,
+                  "cardDmg": {"card-a": 800}, "skillDmg": 0, "invalidDmg": 5999200}),
+                  "logIdList": json.dumps(list(range(20))), "sign": "private-sign"}
+        data = safe_api_request_data(json.dumps(report))["data"]
+        self.assertEqual(data["stat"]["cardDmg"]["card-a"], 800)
+        self.assertEqual(data["logIdList"]["sample"], list(range(20)))
+        self.assertNotIn("private-sign", json.dumps(data))
+
     def test_file_is_readable_before_shutdown_and_has_no_identity_data(self):
         data = safe_api_data({"data": {"userInfo": {"uid": 1234, "nickname": "name"},
                                       "token": "private", "stageInfo": {"curStage": 113},
@@ -101,6 +129,25 @@ console.log('read-only engine inspection passed');
         self.assertEqual(records[0]["duration_s"], 50)
         self.assertFalse(records[0]["partial"])
         self.assertIsNone(b._debug_recorder)
+
+    def test_debug_captures_only_battle_request_bodies(self):
+        class Request:
+            method = "POST"
+            url = "https://www.douyu.com/japi/revenuenc/web/actgame/game/stageEventReport?stage=121&token=secret"
+            post_data = json.dumps({"stage": 121, "battleToken": "secret", "kills": 4})
+
+        b = bot.GuardFishBot(debug=True)
+        captured = []
+        b._debug_write = lambda kind, **data: captured.append((kind, data))
+        b._api_write = lambda obj: captured.append(("api", obj))
+        b._on_request(Request())
+        self.assertEqual(captured[0][0], "api_request")
+        self.assertEqual(captured[0][1]["data"]["data"]["stage"], 121)
+        self.assertEqual(captured[0][1]["query"]["data"]["stage"], 121)
+        self.assertNotIn("secret", json.dumps(captured, ensure_ascii=False))
+        Request.url = "https://www.douyu.com/japi/revenuenc/web/actgame/userTask/receiveAward"
+        b._on_request(Request())
+        self.assertEqual(len(captured), 2, 'do not record unrelated request bodies')
 
 
 if __name__ == "__main__":
