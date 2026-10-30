@@ -9,7 +9,8 @@ EXE_NAME = "保卫鱼娘助手-Debug" if IS_DEBUG_BUILD else "保卫鱼娘助手
 PW_DIR = os.path.dirname(playwright.__file__)
 DRIVER = os.path.join(PW_DIR, "driver")          # node.exe + package/cli.js（约 100MB）
 
-datas = [(DRIVER, os.path.join("playwright", "driver")), ("VERSION", ".")]
+datas = [(DRIVER, os.path.join("playwright", "driver")), ("VERSION", "."),
+         ("api_baseline.json", ".")]
 hiddenimports = ["playwright", "playwright.sync_api", "playwright.async_api", "greenlet"]
 
 a = Analysis(

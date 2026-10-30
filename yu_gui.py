@@ -46,6 +46,13 @@ class App:
         self._log("[系统] 就绪。首次使用请先点「登录斗鱼」登录账号（登录态保存在本机）。")
         self._log("[系统] 数据目录：%s" % botmod.DATA_DIR)
         self._log("[系统] 配置自动保存：%s" % botmod.CONFIG_PATH, "dim")
+        try:
+            monitor = botmod.ApiMonitor(botmod.baseline_path(botmod.DATA_DIR))
+            self._log('[系统] API 监控基准：%s' % monitor.path, 'dim')
+            if monitor.error:
+                self._log('[系统] ' + monitor.error + '；修复后才能挂机。', 'api_alert')
+        except OSError as exc:
+            self._log('[系统] API 基准准备失败：%s' % type(exc).__name__, 'api_alert')
         if self.debug:
             self._log("[系统] Debug 模式：开始挂机后自动生成 logs/debug_*.jsonl 诊断文件。")
         self._log("[系统] 说明：只执行免费操作；绝技/加速/技能刷新等付费功能不会自动点击。")
@@ -62,29 +69,27 @@ class App:
         body = ttk.Frame(self.root, padding=10)
         body.pack(fill="both", expand=True)
         body.columnconfigure(0, weight=1)
-        body.rowconfigure(0, weight=1)
+        body.rowconfigure(2, weight=1)
 
-        # 左侧任务与日志共享宽度，右侧只占游戏控件实际需要的宽度。
-        left = ttk.Frame(body)
-        left.grid(row=0, column=0, sticky="nsew")
-        left.columnconfigure(0, weight=1)
-        left.rowconfigure(2, weight=1)
-        ttk.Separator(body, orient="vertical").grid(row=0, column=1, sticky="ns", padx=10)
-        game = ttk.Frame(body)
-        game.grid(row=0, column=2, sticky="nsw")
-
-        task = ttk.Frame(left)
-        task.grid(row=0, column=0, sticky="ew")
+        top = ttk.Frame(body)
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(0, weight=3)
+        top.columnconfigure(2, weight=2)
+        task = ttk.Frame(top)
+        task.grid(row=0, column=0, sticky="nw")
+        ttk.Separator(top, orient="vertical").grid(row=0, column=1, sticky="ns", padx=12)
+        game = ttk.Frame(top)
+        game.grid(row=0, column=2, sticky="new")
         self._build_task_controls(task)
         self._build_game_controls(game)
 
         self.status = tk.StringVar(value="状态：未运行")
-        status_label = ttk.Label(left, textvariable=self.status, anchor="w",
+        status_label = ttk.Label(body, textvariable=self.status, anchor="w",
                                  font=FONT_B, justify="left", wraplength=780)
         status_label.grid(row=1, column=0, sticky="ew", pady=(10, 7))
-        left.bind("<Configure>", lambda e: status_label.configure(wraplength=max(300, e.width)))
+        body.bind("<Configure>", lambda e: status_label.configure(wraplength=max(300, e.width - 20)))
 
-        log_frame = ttk.Frame(left)
+        log_frame = ttk.Frame(body)
         log_frame.grid(row=2, column=0, sticky="nsew")
         self.text = tk.Text(log_frame, wrap="word", height=22, width=1, font=("Consolas", 10))
         sb = ttk.Scrollbar(log_frame, command=self.text.yview)
@@ -94,6 +99,7 @@ class App:
         for tag, color in (("warn", "#ef6c00"), ("error", "#c62828"),
                            ("win", "#2e7d32"), ("dim", "#888")):
             self.text.tag_config(tag, foreground=color)
+        self.text.tag_config("api_alert", foreground="#c62828", font=("Microsoft YaHei UI", 11, "bold"))
 
     def _build_task_controls(self, parent):
         parent.columnconfigure(0, weight=1)
@@ -119,20 +125,17 @@ class App:
         ttk.Label(gap, text="~", font=FONT).pack(side="left")
         ttk.Entry(gap, textvariable=self.gap_max, width=4, font=FONT).pack(side="left", padx=3)
         ttk.Label(gap, text="秒", font=FONT_S, foreground="#666").pack(side="left")
-        ttk.Button(header, text="打开数据目录", command=self.open_dir).pack(side="right")
-        ttk.Button(header, text="登录斗鱼", command=self.login).pack(side="right", padx=(0, 6))
-
         actions = ttk.Frame(parent)
-        actions.grid(row=1, column=0, sticky="ew", pady=(8, 7))
+        actions.grid(row=1, column=0, sticky="w", pady=(9, 9))
         ttk.Style(self.root).configure("Run.TButton", font=FONT_B, padding=(5, 3))
         buttons = (("start_btn", "开始挂机", self.start, "normal"),
                    ("end_btn", "本场正常结束", self.end_current, "disabled"),
                    ("pause_btn", "暂时停止", self.pause_or_resume, "disabled"),
                    ("stop_btn", "终止并退出", self.stop, "disabled"))
         for column, (name, text, command, state) in enumerate(buttons):
-            actions.columnconfigure(column, weight=1, uniform="actions")
-            button = ttk.Button(actions, text=text, command=command, state=state, style="Run.TButton")
-            button.grid(row=0, column=column, sticky="ew", padx=(0, 6 if column < 3 else 0))
+            button = ttk.Button(actions, text=text, command=command, state=state,
+                                style="Run.TButton", width=-10)
+            button.grid(row=0, column=column, sticky="w", padx=(0, 6 if column < 3 else 0))
             setattr(self, name, button)
 
         targets = ttk.Frame(parent)
@@ -154,10 +157,18 @@ class App:
         ttk.Checkbutton(options, text="免费用尽后银币续打", variable=self.coin_var).pack(side="left", padx=(0, 16))
         ttk.Checkbutton(options, text="尽快完成", variable=self.finish_fast_var,
                         command=self._runtime_options_changed).pack(side="left")
+        tools = ttk.Frame(parent)
+        tools.grid(row=4, column=0, sticky="w", pady=(10, 0))
+        ttk.Button(tools, text="登录斗鱼", command=self.login).pack(side="left", padx=(0, 6))
+        ttk.Button(tools, text="打开数据目录", command=self.open_dir).pack(side="left")
 
     def _build_game_controls(self, parent):
-        hp = ttk.Frame(parent)
-        hp.pack(anchor="w", pady=(0, 9))
+        common = ttk.Frame(parent)
+        common.pack(anchor="w", fill="x")
+        first = ttk.Frame(common)
+        first.pack(anchor="w", pady=(0, 9))
+        hp = ttk.Frame(first)
+        hp.pack(side="left", padx=(0, 16))
         self.hp_var = tk.BooleanVar(value=True)
         self.hp_threshold = tk.StringVar(value="5")
         ttk.Checkbutton(hp, text="血量低于", variable=self.hp_var,
@@ -168,8 +179,8 @@ class App:
         hp_entry.bind("<FocusOut>", lambda _e: self._runtime_options_changed())
         ttk.Label(hp, text="滴回满", font=FONT_S, foreground="#666").pack(side="left")
 
-        damage = ttk.Frame(parent)
-        damage.pack(anchor="w", pady=(0, 9))
+        damage = ttk.Frame(first)
+        damage.pack(side="left")
         self.one_hit_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(damage, text="秒杀", variable=self.one_hit_var,
                         command=self._runtime_options_changed).pack(side="left")
@@ -190,7 +201,7 @@ class App:
         self._update_one_hit_mode_ui()
 
         self.combat_widgets = CombatWidgets(self.root, self._combat_controls_changed, FONT, FONT_S)
-        self.combat_widgets.build_speed(parent)
+        self.combat_widgets.build_speed(common)
         self.combat_widgets.build_effects(parent)
 
     # ---------- 配置（只在 GUI 线程读写 tkinter 变量） ----------
@@ -271,7 +282,9 @@ class App:
                 else:
                     line, level = item, None
                 tag = None
-                if level == "warn" or "!!" in line or "警告" in line:
+                if level == "api_alert":
+                    tag = "api_alert"
+                elif level == "warn" or "!!" in line or "警告" in line:
                     tag = "warn"
                 elif level == "error" or "异常" in line or "失败" in line:
                     tag = "error"

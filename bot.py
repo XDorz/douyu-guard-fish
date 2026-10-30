@@ -29,6 +29,7 @@ from urllib.parse import urlsplit
 from stage_timing import StageTimer, api_stage
 from daily_tasks import DailyChallenge, JS_DAILY_TASK_QUERY
 from diagnostics import DebugRecorder, JS_ENGINE_SNAPSHOT, safe_api_data, safe_api_request_data
+from api_monitor import ApiMonitor, baseline_path
 from combat_controls import (JS_COMBAT_INSTALL, JS_COMBAT_SNAPSHOT, KillStats, ActivityWatch,
                              default_controls, normalize_controls, EFFECTS, EFFECT_LABELS)
 
@@ -1068,6 +1069,13 @@ class GuardFishBot:
         self._date = datetime.date.today().strftime("%Y%m%d")
         self._daily = DailyChallenge()
         self._daily_next_query = 0.0
+        try:
+            monitor_path = baseline_path(DATA_DIR)
+        except OSError:
+            monitor_path = os.path.join(DATA_DIR, 'api_baseline.json')
+        self._api_monitor = ApiMonitor(monitor_path)
+        self._api_handling = False
+        self._api_seen_battle = False
 
         # 对外可见的状态（GUI 读取）
         self.status = {
@@ -1149,11 +1157,13 @@ class GuardFishBot:
             requested = self._pause_requested
         if not requested or self._stop.is_set():
             return not self._stop.is_set()
+        self._api_monitor.suspend()
         self._unload_runtime_script()
         with self._control_lock:
             self._pause_wakeup.clear()
             self._paused = True
-        self.status["state"] = "已暂停（本场未结算）" if unfinished else "已暂停"
+        self.status["state"] = ("API 变动，已暂停" if self._api_handling else
+                                "已暂停（本场未结算）" if unfinished else "已暂停")
         self._debug_write("paused", unfinished=unfinished, rounds_done=self.rounds_done)
         self._log("%s，已完成 %d%s 场；点击「恢复战斗」继续。" %
                   (self.status["state"], self.rounds_done,
@@ -1175,6 +1185,63 @@ class GuardFishBot:
         self._log("已恢复挂机，继续%s（已完成 %d 场）。" %
                   ("当前场监控" if unfinished else "后续场次", self.rounds_done))
         return True
+
+    def _api_checkpoint(self):
+        """在动作边界暂停，保持本场调用栈与计数；回调本身不做浏览器重入。"""
+        monitor = self._api_monitor
+        if not monitor.pending or self._api_handling:
+            return False
+        self._api_handling = True
+        try:
+            while monitor.pending and not self._stop.is_set():
+                monitor.suspend()
+                restored = self._unload_runtime_script()
+                with self._control_lock:
+                    self._pause_requested = True
+                    # API 变化时立即交还原生逻辑，不执行 1 血或停止攻击收尾。
+                    self._natural_end_requested = False
+                    self._natural_end_sent = False
+                    self._natural_end_reason = ''
+                incident = monitor.pending
+                self._log('API 变动，请留意！已暂停助手操作，正在交还原生游戏逻辑。', 'api_alert')
+                self._log('接口：%s' % incident.get('endpoint', incident.get('message', '基准文件异常')), 'api_alert')
+                for diff in incident.get('differences', []):
+                    detail = ('新增字段 %s：%s' % (diff['location'], '、'.join(diff['fields']))
+                              if diff['kind'] == 'new_fields' else
+                              '新增接口' if diff['kind'] == 'new_endpoint' else
+                              '接口域名变化' if diff['kind'] == 'new_host' else '请求数据无法完整检查')
+                    self._log(detail[:1000], 'api_alert')
+                if not restored:
+                    self._log('恢复原生逻辑失败，请留意浏览器状态；助手仍保持暂停。', 'api_alert')
+                try:
+                    report = monitor.write_report(LOGDIR, {
+                        'version': APP_VERSION, 'round': self.status.get('round'),
+                        'rounds_done': self.rounds_done, 'stage': self.status.get('stage'),
+                        'state': self.status.get('state')}, restored)
+                    self._log('API 变动详细报告：%s' % report, 'api_alert')
+                except OSError as exc:
+                    self._log('API 报告写入失败（%s），请保留以上日志。' % type(exc).__name__, 'api_alert')
+                self._debug_write('api_change', incident=incident, runtime_restored=restored)
+                if not self._wait_if_paused(unfinished=self._battle_active):
+                    break
+                monitor.reload()
+                self._api_seen_battle = False
+                self._log('已重新读取 API 基准；恢复识别页面后才重新监控，不自动接受未知字段。', 'dim')
+            return True
+        finally:
+            self._api_handling = False
+
+    def _api_observe_state(self, state):
+        if self._paused or self._api_handling or self._stop.is_set():
+            return
+        if state.get('inBattle') or state.get('skillPanel') or state.get('finalSkillList'):
+            self._api_seen_battle = True
+            self._api_monitor.arm('战斗' if state.get('inBattle') else '选卡')
+        elif self._api_seen_battle and (state.get('result') or state.get('treasure')):
+            self._api_monitor.arm('结算')
+        elif self._is_lobby(state) and self._api_seen_battle:
+            self._api_monitor.suspend()
+            self._api_seen_battle = False
 
     def _log(self, msg, level="info"):
         line = "[%s] %s" % (time.strftime("%H:%M:%S"), msg)
@@ -1220,11 +1287,9 @@ class GuardFishBot:
             self._log("注入 hook 失败：%s" % str(e)[:120], "warn")
         try:
             self._page.on("response", self._on_response)
-            if self.debug:
-                # 只记录战斗上报类请求的脱敏结构；普通版不安装请求监听。
-                self._page.on("request", self._on_request)
-        except Exception:
-            pass
+            self._page.on("request", self._on_request)
+        except Exception as exc:
+            raise RuntimeError('无法安装 API 请求监控，停止挂机') from exc
         # 关闭付费「不再提示」标记（安全兜底）
         try:
             cleared = self._page.evaluate(JS_CLEAR_NO_TIP)
@@ -1255,18 +1320,22 @@ class GuardFishBot:
 
     def _unload_runtime_script(self):
         if self._page is None or not self._runtime_script_loaded:
-            return
+            return True
         self._collect_kills()
         try:
             self._page.evaluate(JS_HP_UNLOAD)
         except Exception as e:
             self._log("卸载回血/秒杀模块失败：%s" % str(e)[:120], "warn")
+            return False
         self._runtime_script_loaded = False
         self._runtime_applied = None
         self._last_runtime_kills = 0
+        return True
 
     def _apply_runtime_controls(self, force=False):
         """在机器人线程内同步实时开关，避免从 GUI 线程调用 Playwright。"""
+        if self._api_checkpoint() or self._paused or self._stop.is_set():
+            return None
         if self._page is None:
             return None
         with self._control_lock:
@@ -1470,7 +1539,17 @@ class GuardFishBot:
 
     # -------- 抓包 --------
     def _on_request(self, req):
-        """Debug 专用：记录战斗上报请求的脱敏字段，避免只看到响应无法判断提交内容。"""
+        """普通/Debug 均检查基准；Debug 额外记录已知战斗请求。"""
+        if self._api_monitor.active:
+            try:
+                if '/actgame/' in urlsplit(req.url).path:
+                    timing = getattr(req, 'timing', {}) or {}
+                    self._api_monitor.observe(req.url, req.method, req.post_data or '',
+                                              started_ms=timing.get('startTime'))
+            except Exception as exc:
+                self._api_monitor.pending = {'kind': 'capture_error',
+                    'message': 'API 监控读取失败：' + type(exc).__name__}
+                self._api_monitor.suspend()
         try:
             if not self.debug:
                 return
@@ -1584,6 +1663,8 @@ class GuardFishBot:
             self.status['daily_target'] = progress['target']
 
     def _refresh_daily_progress(self, force=False):
+        if self._api_checkpoint():
+            return
         if self._page is None or self._paused or self._stop.is_set():
             return
         if self._natural_end_requested and not force:
@@ -1606,8 +1687,16 @@ class GuardFishBot:
             self._debug_write('daily_task_query_error', error_type=type(exc).__name__)
 
     def _state(self):
+        self._api_checkpoint()
+        if self._stop.is_set():
+            return None
         try:
             st = self._page.evaluate(JS_STATE)
+            # evaluate 期间可能分派新的请求；暂停恢复后不能沿用暂停前的状态。
+            if self._api_checkpoint():
+                return self._state()
+            if st:
+                self._api_observe_state(st)
             if self._stage_timer is not None and st and st.get("inBattle"):
                 stage = ((st.get("wm") or {}).get("stage") or {}).get("curStage")
                 self._stage_timer.observe(stage, time.monotonic(), time.time())
@@ -1734,6 +1823,7 @@ class GuardFishBot:
             return self._try_start_battle()
         if self._stop.is_set():
             return False, info
+        self._api_monitor.arm('开局选卡')
         r = self._click(JS_CLICK_CHALLENGE)
         if isinstance(r, dict) and not r.get("ok"):
             self._log("已拦截疑似付费挑战按钮：%s" % (r.get("text") or r.get("why") or "未知"), "warn")
@@ -1915,8 +2005,12 @@ class GuardFishBot:
         return False
 
     def _click(self, js, *args):
+        if self._api_checkpoint() or self._paused or self._stop.is_set():
+            return None
         try:
-            return self._page.evaluate(js, args[0]) if args else self._page.evaluate(js)
+            result = self._page.evaluate(js, args[0]) if args else self._page.evaluate(js)
+            self._api_checkpoint()
+            return result
         except Exception as e:
             self._log("点击执行失败：%s" % str(e)[:120], "warn")
             return None
@@ -1950,6 +2044,10 @@ class GuardFishBot:
                           stop_stage=self.stop_stage, advance_stages=self.advance_stages,
                           max_battle_seconds=self.max_battle_seconds)
         try:
+            self._api_checkpoint()
+            if self._stop.is_set():
+                return
+            self._log('API 监控基准：%s（对战期间启用）' % self._api_monitor.path, 'dim')
             self._ensure_browser()
             if not self._goto_game():
                 self.status["state"] = "未登录"
@@ -2007,6 +2105,7 @@ class GuardFishBot:
             self._log(traceback.format_exc()[-800:], "error")
             self.status["state"] = "异常"
         finally:
+            self._api_monitor.suspend()
             self._finish_stage_timing("运行终止")
             self._debug_write("run_end", state=self.status.get("state"))
             self._battle_active = False

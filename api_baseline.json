@@ -1,0 +1,147 @@
+{
+  "schema_version": 1,
+  "baseline_id": "2026-10-30",
+  "description": "仅在助手接管对战时比较 actgame 请求接口与新增字段；不比较数值、请求次数、字段删除或响应。不会自动学习未知请求。JSON 路径中的 {card_id} 仅匹配数字卡牌 ID；[] 表示数组元素。",
+  "hosts": [
+    "www.douyu.com",
+    "douyu.com"
+  ],
+  "requests": {
+    "POST /japi/revenuenc/web/actgame/game/battleStart": {
+      "source": "2026-10-30 v1.2.1 实际请求",
+      "query": [],
+      "body": [
+        "/ctn",
+        "/rid",
+        "/timestamp"
+      ]
+    },
+    "POST /japi/revenuenc/web/actgame/game/stageStart": {
+      "source": "2026-10-30 v1.2.1 实际请求",
+      "query": [],
+      "body": [
+        "/ctn",
+        "/rid",
+        "/battleId",
+        "/battleToken",
+        "/stage",
+        "/timestamp",
+        "/sign"
+      ]
+    },
+    "POST /japi/revenuenc/web/actgame/game/battleSkillChoice": {
+      "source": "2026-10-30 v1.2.1 实际请求",
+      "query": [],
+      "body": [
+        "/ctn",
+        "/rid",
+        "/battleId",
+        "/battleToken",
+        "/stage",
+        "/timestamp",
+        "/sign",
+        "/skillId"
+      ]
+    },
+    "POST /japi/revenuenc/web/actgame/game/stageEventReport": {
+      "source": "2026-10-30 v1.2.1 实际请求",
+      "query": [],
+      "body": [
+        "/ctn",
+        "/rid",
+        "/battleId",
+        "/battleToken",
+        "/stage",
+        "/timestamp",
+        "/sign",
+        "/logId",
+        "/eventType",
+        "/eventJson"
+      ]
+    },
+    "POST /japi/revenuenc/web/actgame/game/stageEnd": {
+      "source": "2026-10-30 v1.2.1 实际请求",
+      "query": [],
+      "body": [
+        "/ctn",
+        "/rid",
+        "/battleId",
+        "/battleToken",
+        "/stage",
+        "/timestamp",
+        "/sign",
+        "/result",
+        "/curHp",
+        "/logIdList",
+        "/logIdList/[]",
+        "/stat",
+        "/stat/totalDmg",
+        "/stat/cardDmg",
+        "/stat/cardDmg/{card_id}",
+        "/stat/skillDmg",
+        "/stat/invalidDmg"
+      ]
+    },
+    "POST /japi/revenuenc/web/actgame/game/nextStage": {
+      "source": "2026-10-30 公开前端调用点与通用请求封装；待更多实测样本确认",
+      "query": [],
+      "body": [
+        "/ctn",
+        "/rid",
+        "/battleId",
+        "/battleToken",
+        "/stage",
+        "/timestamp",
+        "/sign",
+        "/skillId"
+      ]
+    },
+    "POST /japi/revenuenc/web/actgame/game/receiveBox": {
+      "source": "2026-10-30 公开前端调用点与通用请求封装；待更多实测样本确认",
+      "query": [],
+      "body": [
+        "/ctn",
+        "/rid",
+        "/timestamp"
+      ]
+    },
+    "POST /japi/revenuenc/web/actgame/userTask/receiveBox": {
+      "source": "2026-10-30 公开前端调用点与通用请求封装；待更多实测样本确认",
+      "query": [],
+      "body": [
+        "/ctn",
+        "/rid"
+      ]
+    },
+    "GET /japi/revenuenc/web/actgame/game/battleInfo": {
+      "source": "2026-10-30 公开前端调用点与通用请求封装；待更多实测样本确认",
+      "query": [
+        "/rid",
+        "/battleToken"
+      ],
+      "body": []
+    },
+    "GET /japi/revenuenc/web/actgame/userTask/panelInfo": {
+      "source": "2026-10-30 公开前端调用点与通用请求封装；待更多实测样本确认",
+      "query": [
+        "/rid"
+      ],
+      "body": []
+    },
+    "GET /japi/revenuenc/web/actgame/userTask/weekPassTask": {
+      "source": "2026-10-30 公开前端调用点与通用请求封装；待更多实测样本确认",
+      "query": [
+        "/rid"
+      ],
+      "body": []
+    },
+    "POST /japi/revenuenc/web/actgame/basics/panelInfo": {
+      "source": "2026-10-30 公开前端调用点与通用请求封装；待更多实测样本确认",
+      "query": [],
+      "body": [
+        "/ctn",
+        "/rid"
+      ]
+    }
+  }
+}

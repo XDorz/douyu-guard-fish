@@ -73,11 +73,13 @@ class CombatWidgets:
                 pass
 
     def build_speed(self, parent):
-        speed = ttk.Frame(parent)
-        speed.pack(anchor='w', pady=(0, 9))
+        row = ttk.Frame(parent)
+        row.pack(anchor='w', pady=(0, 12))
+        speed = ttk.Frame(row)
+        speed.pack(side='left', padx=(0, 16))
         self._group('attack_speed', speed, '全局攻速')
-        repeat = ttk.Frame(parent)
-        repeat.pack(anchor='w', pady=(0, 16))
+        repeat = ttk.Frame(row)
+        repeat.pack(side='left')
         ttk.Checkbutton(repeat, text='冰可重复', variable=self.repeat_ice,
                         command=self.flush).pack(side='left', padx=(0, 12))
         ttk.Checkbutton(repeat, text='土可重复', variable=self.repeat_earth,
@@ -85,14 +87,18 @@ class CombatWidgets:
 
     def build_effects(self, parent):
         panel = ttk.Frame(parent)
-        panel.pack(anchor='nw')
-        for name in EFFECTS:
+        panel.pack(anchor='nw', fill='x')
+        panel.columnconfigure(0, weight=1)
+        panel.columnconfigure(2, weight=1)
+        ttk.Separator(panel, orient='vertical').grid(row=0, column=1, rowspan=3, sticky='ns', padx=12)
+        ttk.Separator(panel, orient='horizontal').grid(row=1, column=0, columnspan=3, sticky='ew', pady=8)
+        for index, name in enumerate(EFFECTS):
             frame = ttk.Frame(panel)
-            frame.pack(anchor='w', fill='x', pady=(0, 12))
+            frame.grid(row=(index // 2) * 2, column=(index % 2) * 2, sticky='nw')
             self._group(name, frame, EFFECT_LABELS[name])
-        notes = ttk.Label(panel, text='CD -1 原速；风最低 0.5 秒。\n其他系最低 CD 为 0。\n攻速负倍率减速，0 为原速。\n固定攻速按间隔设置。\n时间单位均为游戏秒。\n数字失焦或回车后应用。',
-                          font=self.small_font, foreground='#666', justify='left', anchor='nw', wraplength=195)
-        notes.pack(anchor='nw', fill='x')
+        notes = ttk.Label(parent, text='CD -1 原速；风最低 0.5 秒，其余系 0。\n时间单位为游戏秒；数字失焦或回车后应用。',
+                          font=self.small_font, foreground='#666', justify='left', anchor='nw')
+        notes.pack(anchor='nw', pady=(9, 0))
 
     def _schedule(self, *_args):
         if self.loading:
