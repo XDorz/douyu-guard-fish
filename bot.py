@@ -31,7 +31,7 @@ from daily_tasks import DailyChallenge, JS_DAILY_TASK_QUERY
 from diagnostics import DebugRecorder, JS_ENGINE_SNAPSHOT, safe_api_data, safe_api_request_data
 from api_monitor import ApiMonitor, baseline_path
 from combat_controls import (JS_COMBAT_INSTALL, JS_COMBAT_SNAPSHOT, KillStats, ActivityWatch,
-                             default_controls, normalize_controls, EFFECTS, EFFECT_LABELS)
+                             default_controls, normalize_controls, EFFECTS, EFFECT_LABELS, PARAMETERS)
 
 APP_NAME = "保卫鱼娘挂机助手"
 try:
@@ -1406,7 +1406,8 @@ class GuardFishBot:
                               if combat["attack_speed"]["mode"] == "fixed" else
                               "倍率 %.3g" % combat["attack_speed"]["multiplier"])
                              if combat["attack_speed"]["enabled"] else "关",
-                             "/".join(EFFECT_LABELS[k] for k, v in combat["effects"].items() if v["enabled"]) or "关"), "dim")
+                             "/".join([EFFECT_LABELS[k] for k, v in combat["effects"].items() if v["enabled"]] +
+                                      [PARAMETERS[k][0] for k, v in combat['parameters'].items() if v['enabled']]) or "关"), "dim")
                 self._debug_write("runtime_config", combat=combat, hp_guard=hp_guard, one_hit=one_hit,
                                   one_hit_mode=one_hit_mode, one_hit_probability=one_hit_probability,
                                   attack_multiplier=attack_multiplier, attack_fixed=attack_fixed,
@@ -2694,6 +2695,11 @@ def main(default_debug=False):
                              help="固定攻击间隔（游戏秒），自动限制到 0.2~180")
     ap.add_argument("--repeat-ice", action="store_true", help="允许同一敌人本关重复冰冻")
     ap.add_argument("--repeat-earth", action="store_true", help="允许同一敌人本关重复减速/眩晕")
+    for key, spec in PARAMETERS.items():
+        group = ap.add_mutually_exclusive_group()
+        option = key.replace('_', '-')
+        group.add_argument('--' + option, type=float, help=spec[0] + '固定值（' + spec[1] + '）')
+        group.add_argument('--' + option + '-multiplier', type=float, help=spec[0] + '相对原值的倍率')
     for effect in EFFECTS:
         chance_group = ap.add_mutually_exclusive_group()
         chance_group.add_argument("--%s-probability" % effect, type=float,
@@ -2715,6 +2721,11 @@ def main(default_debug=False):
             combat["attack_speed"].update(enabled=True, mode="multiplier" if field == "multiplier" else "fixed")
             combat["attack_speed"][field] = value
     combat.update(repeat_ice=args.repeat_ice, repeat_earth=args.repeat_earth)
+    for key in PARAMETERS:
+        for field, option in (('fixed', key), ('multiplier', key + '_multiplier')):
+            value = getattr(args, option)
+            if value is not None:
+                combat['parameters'][key].update(enabled=True, mode=field, **{field: value})
     for effect in EFFECTS:
         rule = combat["effects"][effect]
         for suffix, field in (("probability", "probability"), ("probability_multiplier", "multiplier"), ("cd", "cd")):

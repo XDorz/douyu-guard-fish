@@ -73,8 +73,8 @@ class App:
 
         top = ttk.Frame(body)
         top.grid(row=0, column=0, sticky="ew")
-        top.columnconfigure(0, weight=3)
-        top.columnconfigure(2, weight=2)
+        top.columnconfigure(0, weight=1)
+        top.columnconfigure(2, weight=1)
         task = ttk.Frame(top)
         task.grid(row=0, column=0, sticky="nw")
         ttk.Separator(top, orient="vertical").grid(row=0, column=1, sticky="ns", padx=12)
@@ -161,6 +161,13 @@ class App:
         tools.grid(row=4, column=0, sticky="w", pady=(10, 0))
         ttk.Button(tools, text="登录斗鱼", command=self.login).pack(side="left", padx=(0, 6))
         ttk.Button(tools, text="打开数据目录", command=self.open_dir).pack(side="left")
+        tips = ttk.Label(parent, text="本场正常结束：收尾本场，随后继续下一场。\n"
+                         "暂时停止：收尾回主界面，保留场数等待恢复。\n"
+                         "终止并退出：立即停止助手并关闭浏览器。\n"
+                         "尽快完成：每场开局后自动收尾，用于完成每日次数。\n"
+                         "API 变动暂停：撤销覆盖并保留浏览器，查看日志报告。",
+                         font=FONT_S, foreground="#666", justify="left", wraplength=440)
+        tips.grid(row=5, column=0, sticky="w", pady=(14, 0))
 
     def _build_game_controls(self, parent):
         common = ttk.Frame(parent)

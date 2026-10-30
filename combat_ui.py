@@ -3,7 +3,7 @@ import math
 import tkinter as tk
 from tkinter import ttk
 
-from combat_controls import EFFECTS, EFFECT_LABELS, default_controls, normalize_controls
+from combat_controls import EFFECTS, EFFECT_LABELS, PARAMETERS, default_controls, normalize_controls
 
 
 class CombatWidgets:
@@ -24,13 +24,15 @@ class CombatWidgets:
         group = {
             'enabled': tk.BooleanVar(value=False), 'mode': tk.StringVar(value='倍率'),
             'value': tk.StringVar(value='1'), 'last_mode': 'multiplier',
-            'cache': {'fixed': '1' if key == 'attack_speed' else ('40' if key == 'ice' else '50'),
+            'cache': {'fixed': str(PARAMETERS[key][2]) if key in PARAMETERS else
+                     '1' if key == 'attack_speed' else ('40' if key == 'ice' else '50'),
                       'multiplier': '1'},
         }
         self.groups[key] = group
         first, second = ttk.Frame(parent), ttk.Frame(parent)
         first.pack(anchor='w', fill='x')
-        if key == 'attack_speed':
+        compact = key not in EFFECTS
+        if compact:
             second = first
         else:
             second.pack(anchor='w', fill='x', pady=(5, 0))
@@ -41,7 +43,7 @@ class CombatWidgets:
         box.pack(side='left', padx=(0, 4))
         box.bind('<<ComboboxSelected>>', lambda _e: self._mode_changed(key))
         group['label'] = ttk.Label(second, text='倍率', font=self.small_font)
-        if key != 'attack_speed':
+        if not compact:
             group['label'].pack(side='left')
         entry = ttk.Entry(second, textvariable=group['value'], width=5, font=self.font)
         entry.pack(side='left', padx=(4, 3))
@@ -49,7 +51,7 @@ class CombatWidgets:
         entry.bind('<FocusOut>', lambda _e: self.flush())
         group['unit'] = ttk.Label(second, text='倍', font=self.small_font)
         group['unit'].pack(side='left')
-        if key != 'attack_speed':
+        if key == 'wind':
             group['cd'] = tk.StringVar(value='-1')
             ttk.Label(second, text='CD', font=self.small_font).pack(side='left', padx=(8, 4))
             cd = ttk.Entry(second, textvariable=group['cd'], width=4, font=self.font)
@@ -66,7 +68,7 @@ class CombatWidgets:
         if cls not in ('Entry', 'TEntry', 'Combobox', 'TCombobox'):
             self.flush()
         if cls in ('Tk', 'Toplevel', 'Frame', 'TFrame', 'Label', 'TLabel',
-                   'Labelframe', 'TLabelframe', 'PanedWindow', 'TPanedwindow'):
+                   'Labelframe', 'TLabelframe', 'PanedWindow', 'TPanedwindow', 'TSeparator'):
             try:
                 self.root.focus_set()
             except tk.TclError:
@@ -74,7 +76,7 @@ class CombatWidgets:
 
     def build_speed(self, parent):
         row = ttk.Frame(parent)
-        row.pack(anchor='w', pady=(0, 12))
+        row.pack(anchor='w', pady=(0, 6))
         speed = ttk.Frame(row)
         speed.pack(side='left', padx=(0, 16))
         self._group('attack_speed', speed, '全局攻速')
@@ -84,8 +86,12 @@ class CombatWidgets:
                         command=self.flush).pack(side='left', padx=(0, 12))
         ttk.Checkbutton(repeat, text='土可重复', variable=self.repeat_earth,
                         command=self.flush).pack(side='left')
+        earth = ttk.Frame(parent)
+        earth.pack(anchor='w', pady=(0, 2))
+        self._group('earth_slow', earth, PARAMETERS['earth_slow'][0])
 
     def build_effects(self, parent):
+        ttk.Separator(parent, orient='horizontal').pack(fill='x', pady=(7, 10))
         panel = ttk.Frame(parent)
         panel.pack(anchor='nw', fill='x')
         panel.columnconfigure(0, weight=1)
@@ -96,7 +102,12 @@ class CombatWidgets:
             frame = ttk.Frame(panel)
             frame.grid(row=(index // 2) * 2, column=(index % 2) * 2, sticky='nw')
             self._group(name, frame, EFFECT_LABELS[name])
-        notes = ttk.Label(parent, text='CD -1 原速；风最低 0.5 秒，其余系 0。\n时间单位为游戏秒；数字失焦或回车后应用。',
+            key = {'thunder': 'thunder_count', 'fire': 'fire_crit', 'ice': 'ice_duration'}.get(name)
+            if key:
+                extra = ttk.Frame(frame)
+                extra.pack(anchor='w', pady=(6, 0))
+                self._group(key, extra, PARAMETERS[key][0])
+        notes = ttk.Label(parent, text='风系 CD：-1 原速，最低 0.5 秒。时间单位为游戏秒。\n数字失焦或回车后应用；各项独立勾选生效。',
                           font=self.small_font, foreground='#666', justify='left', anchor='nw')
         notes.pack(anchor='nw', pady=(9, 0))
 
@@ -127,23 +138,32 @@ class CombatWidgets:
     def _update_unit(self, key):
         group = self.groups[key]
         fixed = self._mode(group) == 'fixed'
-        group['unit'].config(text=('秒' if key == 'attack_speed' else '%') if fixed else '倍')
+        unit = PARAMETERS[key][1] if key in PARAMETERS else '秒' if key == 'attack_speed' else '%'
+        group['unit'].config(text=unit if fixed else '倍')
         group['label'].config(text='概率' if fixed else '倍率')
 
     def values(self):
-        raw = {'effects': {}, 'repeat_ice': self.repeat_ice.get(), 'repeat_earth': self.repeat_earth.get()}
+        raw = {'effects': {}, 'parameters': {}, 'repeat_ice': self.repeat_ice.get(), 'repeat_earth': self.repeat_earth.get()}
         for key, group in self.groups.items():
             mode = self._mode(group)
             group['cache'][mode] = group['value'].get()
             values = {'enabled': group['enabled'].get(), 'mode': mode,
                       'multiplier': group['cache']['multiplier'],
-                      'fixed' if key == 'attack_speed' else 'probability': group['cache']['fixed']}
+                      'probability' if key in EFFECTS else 'fixed': group['cache']['fixed']}
             if key == 'attack_speed':
                 raw[key] = values
+            elif key in PARAMETERS:
+                raw['parameters'][key] = values
             else:
-                values['cd'] = group['cd'].get()
+                # GUI 不再施加雷/火/冰的人工 CD，清除旧配置遗留的隐藏限制。
+                values['cd'] = group['cd'].get() if 'cd' in group else -1
                 raw['effects'][key] = values
         return normalize_controls(raw, self.current)
+
+    @staticmethod
+    def _rule(controls, key):
+        return (controls['effects'][key] if key in EFFECTS else
+                controls['parameters'][key] if key in PARAMETERS else controls[key])
 
     def _apply(self, commit=False):
         self.job = None
@@ -151,8 +171,8 @@ class CombatWidgets:
         self.loading = True
         try:
             for key, group in self.groups.items():
-                normalized = values[key] if key == 'attack_speed' else values['effects'][key]
-                field = ('fixed' if key == 'attack_speed' else 'probability') if self._mode(group) == 'fixed' else 'multiplier'
+                normalized = self._rule(values, key)
+                field = ('probability' if key in EFFECTS else 'fixed') if self._mode(group) == 'fixed' else 'multiplier'
                 entries = [(group['value'], normalized[field])]
                 if 'cd' in group:
                     entries.append((group['cd'], normalized['cd']))
@@ -182,11 +202,11 @@ class CombatWidgets:
             self.repeat_ice.set(self.current['repeat_ice'])
             self.repeat_earth.set(self.current['repeat_earth'])
             for key, group in self.groups.items():
-                data = self.current[key] if key == 'attack_speed' else self.current['effects'][key]
+                data = self._rule(self.current, key)
                 group['enabled'].set(data['enabled'])
                 group['mode'].set('固定' if data['mode'] == 'fixed' else '倍率')
                 group['last_mode'] = data['mode']
-                group['cache'] = {'fixed': format(data['fixed' if key == 'attack_speed' else 'probability'], '.12g'),
+                group['cache'] = {'fixed': format(data['probability' if key in EFFECTS else 'fixed'], '.12g'),
                                   'multiplier': format(data['multiplier'], '.12g')}
                 group['value'].set(group['cache'][data['mode']])
                 if 'cd' in group:

@@ -6,12 +6,20 @@ import math
 EFFECTS = ("thunder", "fire", "ice", "wind")
 EFFECT_LABELS = {"thunder": "雷系传导", "fire": "火系暴击", "ice": "冰系冰冻", "wind": "风系横扫"}
 CD_LIMITS = {name: (0.5 if name == "wind" else 0.0, 180.0) for name in EFFECTS}
+PARAMETERS = {
+    'thunder_count': ('连锁数量', '个', 3.0, 1.0, 50.0),
+    'fire_crit': ('暴击伤害', '倍', 2.0, 0.0, 100.0),
+    'ice_duration': ('冰冻时长', '秒', 3.0, 0.1, 180.0),
+    'earth_slow': ('土系减速', '%', 50.0, 0.0, 100.0),
+}
 
 
 def default_controls():
     return {
         "attack_speed": {"enabled": False, "mode": "multiplier", "multiplier": 1.0, "fixed": 1.0},
         "repeat_ice": False, "repeat_earth": False,
+        "parameters": {key: {"enabled": False, "mode": "multiplier", "multiplier": 1.0,
+                             "fixed": spec[2]} for key, spec in PARAMETERS.items()},
         "effects": {name: {"enabled": False, "mode": "multiplier", "multiplier": 1.0,
                            "probability": 40.0 if name == "ice" else 50.0,
                            # -1 means keep the native timing.  In particular, the
@@ -33,6 +41,7 @@ def _number(value, fallback, low, high):
 
 def normalize_controls(values, base=None):
     result = deepcopy(base if base is not None else default_controls())
+    result.setdefault('parameters', default_controls()['parameters'])
     if not isinstance(values, dict):
         return result
     for key in ("repeat_ice", "repeat_earth"):
@@ -67,6 +76,21 @@ def normalize_controls(values, base=None):
             mult = _number(raw.get("multiplier"), target["multiplier"], -100, 100)
             # 负数只用于减速；-0.5 归到 -1，避免负值反而加速。
             target["multiplier"] = min(-1, mult) if mult < 0 else (max(0.01, mult) if mult else 0.0)
+    parameters = values.get('parameters')
+    if isinstance(parameters, dict):
+        for key, spec in PARAMETERS.items():
+            target = result['parameters'][key]
+            raw = parameters.get(key)
+            if not isinstance(raw, dict):
+                continue
+            if isinstance(raw.get('enabled'), bool):
+                target['enabled'] = raw['enabled']
+            if raw.get('mode') in ('fixed', 'multiplier'):
+                target['mode'] = raw['mode']
+            target['fixed'] = _number(raw.get('fixed'), target['fixed'], spec[3], spec[4])
+            target['multiplier'] = _number(raw.get('multiplier'), target['multiplier'], 0, 100)
+            if key == 'thunder_count':
+                target['fixed'] = int(math.floor(target['fixed'] + 0.5))
     return result
 
 
@@ -215,6 +239,12 @@ JS_COMBAT_INSTALL = r"""
     const last = meta.triggered.get(card.cardInstanceId);
     return last === undefined || meta.clock - last >= rule.cd * 1000;
   }
+  const parameter = key => (cfg.parameters || {})[key];
+  const parameterOn = key => !!(parameter(key) && parameter(key).enabled);
+  function adjusted(key, base, low, high) {
+    const rule = parameter(key);
+    return clamp(rule.mode === 'fixed' ? Number(rule.fixed) : base * Number(rule.multiplier), low, high);
+  }
   function sync(loop) {
     if (!loop) return;
     currentLoop = loop;
@@ -252,7 +282,7 @@ JS_COMBAT_INSTALL = r"""
     const fire = cfg.effects.fire;
     const customCD = ['thunder', 'ice'].some(k => cfg.effects[k] && cfg.effects[k].enabled && cfg.effects[k].cd > 0);
     const fixedAttack = !!(GF.oneHit && GF.oneHitMode === 'fixed_attack');
-    const attacks = GF.finishing || fixedAttack || cfg.attack_speed.enabled || fire && fire.enabled || customCD;
+    const attacks = GF.finishing || fixedAttack || cfg.attack_speed.enabled || fire && fire.enabled || customCD || parameterOn('fire_crit');
     method(meta, loop, '_updateCardAttacks', !!attacks, original => function(dt) {
       meta.clock += Math.max(0, Number(dt) || 0) * 1000;
       if (GF.finishing) {
@@ -294,6 +324,11 @@ JS_COMBAT_INSTALL = r"""
             const [key, value] = probabilityField(card, rate);
             set(card, key, value);
           }
+          if (card.camp === 3 && parameterOn('fire_crit')) {
+            // 倍率整体缩放原生暴伤区间；固定值令区间两端相同。
+            set(card, 'campVal2', adjusted('fire_crit', card.campVal2, 0, 100));
+            set(card, 'campVal3', adjusted('fire_crit', card.campVal3, 0, 100));
+          }
         }
         return original.apply(this, arguments);
       } finally {
@@ -311,7 +346,9 @@ JS_COMBAT_INSTALL = r"""
       }
       return result;
     });
-    const hitEnabled = fixedAttack || cfg.repeat_ice || cfg.repeat_earth || ['thunder', 'ice', 'wind'].some(k => cfg.effects[k] && cfg.effects[k].enabled);
+    const hitEnabled = fixedAttack || cfg.repeat_ice || cfg.repeat_earth ||
+      ['thunder_count', 'ice_duration', 'earth_slow'].some(parameterOn) ||
+      ['thunder', 'ice', 'wind'].some(k => cfg.effects[k] && cfg.effects[k].enabled);
     method(meta, loop, '_applyProjectileHit', !!hitEnabled && !GF.finishing, original => function(card, target) {
       const name = card && camps[card.camp], rule = cfg.effects[name];
       if (!card || GF.finishing) return original.apply(this, arguments);
@@ -328,8 +365,24 @@ JS_COMBAT_INSTALL = r"""
       if (hadTarget) seen.delete(target.id);
       if (changed) card[field] = value;
       if (changed && name === 'wind' && rule.cd >= 0) card.campVal2 = rule.cd;
-      try { return original.apply(this, arguments); }
+      const extraSaved = [];
+      const setExtra = (key, val) => { extraSaved.push([key, card[key]]); card[key] = val; };
+      try {
+        if (card.camp === 1 && parameterOn('thunder_count'))
+          setExtra('campVal2', Math.round(adjusted('thunder_count', card.campVal2, 1, 50)));
+        if (card.camp === 4 && parameterOn('ice_duration')) {
+          const seconds = adjusted('ice_duration', card.attrVal * (1 + card.campVal2), 0.1, 180);
+          setExtra('attrVal', seconds);
+          setExtra('campVal2', 0);
+        }
+        if (card.camp === 2 && parameterOn('earth_slow')) {
+          const factor = card.campVal2 > 1 ? 0 : clamp(card.campVal2, 0, 1);
+          setExtra('campVal2', 1 - adjusted('earth_slow', (1 - factor) * 100, 0, 100) / 100);
+        }
+        return original.apply(this, arguments);
+      }
       finally {
+        for (let i = extraSaved.length - 1; i >= 0; i--) card[extraSaved[i][0]] = extraSaved[i][1];
         if (changed && skillCount(this, card) > skills) meta.triggered.set(card.cardInstanceId, meta.clock);
         if (changed) card[field] = before;
         if (changed && name === 'wind' && rule.cd >= 0) card.campVal2 = oldCD;
