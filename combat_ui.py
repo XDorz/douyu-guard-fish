@@ -35,15 +35,15 @@ class CombatWidgets:
         else:
             second.pack(anchor='w', fill='x', pady=(5, 0))
         ttk.Checkbutton(first, text=title, variable=group['enabled'],
-                        command=self.flush).pack(side='left', padx=(0, 8))
+                        command=self.flush).pack(side='left', padx=(0, 4))
         box = ttk.Combobox(first, textvariable=group['mode'], values=('倍率', '固定'),
                            width=5, state='readonly', font=self.font)
-        box.pack(side='left', padx=(0, 8))
+        box.pack(side='left', padx=(0, 4))
         box.bind('<<ComboboxSelected>>', lambda _e: self._mode_changed(key))
         group['label'] = ttk.Label(second, text='倍率', font=self.small_font)
         if key != 'attack_speed':
             group['label'].pack(side='left')
-        entry = ttk.Entry(second, textvariable=group['value'], width=6, font=self.font)
+        entry = ttk.Entry(second, textvariable=group['value'], width=5, font=self.font)
         entry.pack(side='left', padx=(4, 3))
         entry.bind('<Return>', lambda _e: self.flush())
         entry.bind('<FocusOut>', lambda _e: self.flush())
@@ -51,8 +51,8 @@ class CombatWidgets:
         group['unit'].pack(side='left')
         if key != 'attack_speed':
             group['cd'] = tk.StringVar(value='-1')
-            ttk.Label(second, text='CD', font=self.small_font).pack(side='left', padx=(12, 4))
-            cd = ttk.Entry(second, textvariable=group['cd'], width=5, font=self.font)
+            ttk.Label(second, text='CD', font=self.small_font).pack(side='left', padx=(8, 4))
+            cd = ttk.Entry(second, textvariable=group['cd'], width=4, font=self.font)
             cd.pack(side='left')
             cd.bind('<Return>', lambda _e: self.flush())
             cd.bind('<FocusOut>', lambda _e: self.flush())
@@ -74,22 +74,24 @@ class CombatWidgets:
 
     def build_speed(self, parent):
         speed = ttk.Frame(parent)
-        speed.pack(side='left', padx=(22, 0))
+        speed.pack(anchor='w', pady=(0, 9))
         self._group('attack_speed', speed, '全局攻速')
-        ttk.Checkbutton(parent, text='冰可重复', variable=self.repeat_ice,
-                        command=self.flush).pack(side='left', padx=(16, 8))
-        ttk.Checkbutton(parent, text='土可重复', variable=self.repeat_earth,
+        repeat = ttk.Frame(parent)
+        repeat.pack(anchor='w', pady=(0, 16))
+        ttk.Checkbutton(repeat, text='冰可重复', variable=self.repeat_ice,
+                        command=self.flush).pack(side='left', padx=(0, 12))
+        ttk.Checkbutton(repeat, text='土可重复', variable=self.repeat_earth,
                         command=self.flush).pack(side='left')
 
     def build_effects(self, parent):
-        panel = ttk.LabelFrame(parent, text='分系设置', padding=(10, 8))
-        panel.pack(anchor='nw', fill='both', expand=True)
+        panel = ttk.Frame(parent)
+        panel.pack(anchor='nw')
         for name in EFFECTS:
             frame = ttk.Frame(panel)
             frame.pack(anchor='w', fill='x', pady=(0, 12))
             self._group(name, frame, EFFECT_LABELS[name])
-        notes = ttk.Label(panel, text='固定概率对同系所有卡生效。\n倍率按各卡原有概率计算。\n风系共享 CD，其余按卡计时。\nCD -1 原速；风最低 0.5 秒，\n其余最低 0，越界自动修正。\n固定攻速值为攻击间隔。\n负倍率减速，0 为原速。\n间隔与 CD 均为游戏内秒。\n数字失焦或回车后应用。',
-                          font=self.small_font, foreground='#666', justify='left', anchor='nw', wraplength=235)
+        notes = ttk.Label(panel, text='CD -1 原速；风最低 0.5 秒。\n其他系最低 CD 为 0。\n攻速负倍率减速，0 为原速。\n固定攻速按间隔设置。\n时间单位均为游戏秒。\n数字失焦或回车后应用。',
+                          font=self.small_font, foreground='#666', justify='left', anchor='nw', wraplength=195)
         notes.pack(anchor='nw', fill='x')
 
     def _schedule(self, *_args):

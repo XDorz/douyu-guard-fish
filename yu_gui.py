@@ -59,144 +59,139 @@ class App:
 
     # ---------- UI ----------
     def _build(self):
-        top = ttk.Frame(self.root, padding=(10, 10, 10, 4))
-        top.pack(fill="x")
-        top.columnconfigure(0, weight=1)
-        header = ttk.Frame(top)
-        header.grid(row=0, column=0, sticky="w")
-        options = ttk.Frame(top)
-        options.grid(row=2, column=0, sticky="w", pady=(8, 0))
-        actions = ttk.Frame(top)
-        actions.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        body = ttk.Frame(self.root, padding=10)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
 
-        ttk.Label(header, text="房间号", font=FONT).grid(row=0, column=0, sticky="w")
-        self.rid = tk.StringVar(value=botmod.DEFAULT_RID)
-        ttk.Entry(header, textvariable=self.rid, width=10, font=FONT).grid(row=0, column=1, padx=(4, 14))
+        # 左侧任务与日志共享宽度，右侧只占游戏控件实际需要的宽度。
+        left = ttk.Frame(body)
+        left.grid(row=0, column=0, sticky="nsew")
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(2, weight=1)
+        ttk.Separator(body, orient="vertical").grid(row=0, column=1, sticky="ns", padx=10)
+        game = ttk.Frame(body)
+        game.grid(row=0, column=2, sticky="nsw")
 
-        ttk.Label(header, text="场数(0=不限)", font=FONT).grid(row=0, column=2, sticky="w")
-        self.rounds = tk.StringVar(value="0")
-        ttk.Entry(header, textvariable=self.rounds, width=6, font=FONT).grid(row=0, column=3, padx=(4, 14))
-
-        ttk.Label(header, text="场间等待(秒)", font=FONT).grid(row=0, column=4, sticky="w")
-        self.gap_min = tk.StringVar(value="5")
-        self.gap_max = tk.StringVar(value="15")
-        ttk.Entry(header, textvariable=self.gap_min, width=5, font=FONT).grid(row=0, column=5, padx=(4, 2))
-        ttk.Label(header, text="~", font=FONT).grid(row=0, column=6)
-        ttk.Entry(header, textvariable=self.gap_max, width=5, font=FONT).grid(row=0, column=7, padx=(2, 14))
-
-        # 回血守护：血量低于阈值自动回满
-        hp_frame = ttk.Frame(options)
-        hp_frame.pack(side="left", padx=(0, 20))
-        self.hp_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(hp_frame, text="血量低于", variable=self.hp_var,
-                        command=self._runtime_options_changed).pack(side="left")
-        self.hp_threshold = tk.StringVar(value="5")
-        hp_entry = ttk.Entry(hp_frame, textvariable=self.hp_threshold, width=4, font=FONT)
-        hp_entry.pack(side="left", padx=3)
-        hp_entry.bind("<Return>", lambda _e: self._runtime_options_changed())
-        hp_entry.bind("<FocusOut>", lambda _e: self._runtime_options_changed())
-        ttk.Label(hp_frame, text="滴自动回满", font=FONT_S, foreground="#666").pack(side="left")
-
-        # 银币续打：免费用尽后花银币继续（银币免费获取，不用鱼翅）
-        self.coin_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(options, text="免费用尽后用银币续打（银币免费获得）",
-                        variable=self.coin_var).pack(side="left", padx=(0, 20))
-        self.finish_fast_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(options, text="尽快完成", variable=self.finish_fast_var,
-                        command=self._runtime_options_changed).pack(side="left")
-
-        # 秒杀策略：默认保留原来的全额秒杀，也可切换成概率或攻击倍率。
-        combat_row = ttk.Frame(top)
-        combat_row.grid(row=3, column=0, sticky="w", pady=(8, 0))
-        one_hit_frame = ttk.Frame(combat_row)
-        one_hit_frame.pack(side="left")
-        self.one_hit_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(one_hit_frame, text="秒杀",
-                        variable=self.one_hit_var,
-                        command=self._runtime_options_changed).pack(side="left")
-        self.one_hit_mode = tk.StringVar(value="全额秒杀")
-        self._last_one_hit_mode = "full"
-        self.one_hit_mode_box = ttk.Combobox(
-            one_hit_frame, textvariable=self.one_hit_mode, width=10, state="readonly",
-            values=[label for label, _ in ONE_HIT_MODE_LABELS], font=FONT)
-        self.one_hit_mode_box.pack(side="left", padx=(5, 3))
-        self.one_hit_mode_box.bind("<<ComboboxSelected>>", self._one_hit_mode_changed)
-        self.one_hit_value = tk.StringVar(value="50")
-        self.one_hit_value_entry = ttk.Entry(one_hit_frame, textvariable=self.one_hit_value,
-                                             width=8, font=FONT)
-        self.one_hit_value_entry.pack(side="left", padx=(0, 2))
-        self.one_hit_value_entry.bind("<Return>", lambda _e: self._runtime_options_changed())
-        self.one_hit_value_entry.bind("<FocusOut>", lambda _e: self._runtime_options_changed())
-        self.one_hit_unit = ttk.Label(one_hit_frame, text="", font=FONT_S, foreground="#666")
-        self.one_hit_unit.pack(side="left")
-        self._update_one_hit_mode_ui()
-        self.combat_widgets = CombatWidgets(self.root, self._combat_controls_changed, FONT, FONT_S)
-        self.combat_widgets.build_speed(combat_row)
-
-        self.headless_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(header, text="后台运行(隐藏浏览器)", variable=self.headless_var).grid(row=0, column=8, padx=(0, 14))
-
-        self.start_btn = tk.Button(actions, text="开始挂机", width=11, font=FONT_B,
-                                   bg="#43a047", fg="white", command=self.start)
-        self.start_btn.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self.stop_btn = tk.Button(actions, text="终止并退出", width=10, font=FONT_B,
-                                  state="disabled", command=self.stop)
-        self.stop_btn.pack(side="left", fill="x", expand=True, padx=(0, 8))
-
-        self.end_btn = tk.Button(actions, text="本场正常结束", width=12, font=FONT_B,
-                                 state="disabled", command=self.end_current)
-        self.end_btn.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self.pause_btn = tk.Button(actions, text="暂时停止", width=10, font=FONT_B,
-                                   state="disabled", command=self.pause_or_resume)
-        self.pause_btn.pack(side="left", fill="x", expand=True, padx=(0, 14))
-        ttk.Button(actions, text="登录斗鱼", width=10, command=self.login).pack(side="left", fill="x", expand=True, padx=(0, 6))
-        ttk.Button(actions, text="打开数据目录", width=12, command=self.open_dir).pack(side="left", fill="x", expand=True)
-
-        # 关卡目标和单场监控时限。两个关卡目标同时设置时取较大的实际关卡数。
-        # 每个配置使用一个紧凑的小组，避免 grid 跨列后产生过大的组内间距。
-        self.stop_stage = tk.StringVar(value="0")
-        self.advance_stages = tk.StringVar(value="0")
-        self.max_minutes = tk.StringVar(value="13")
-        target_row = ttk.Frame(top)
-        target_row.grid(row=4, column=0, sticky="w", pady=(8, 0))
-
-        def target_group(title, variable, suffix):
-            group = ttk.Frame(target_row)
-            group.pack(side="left", padx=(0, 16))
-            ttk.Label(group, text=title, font=FONT).pack(side="left")
-            ttk.Entry(group, textvariable=variable, width=6, font=FONT).pack(side="left", padx=(5, 2))
-            ttk.Label(group, text=suffix, font=FONT_S, foreground="#666").pack(side="left")
-
-        target_group("固定关卡", self.stop_stage, "关结束（0=关）")
-        target_group("推进", self.advance_stages, "关后结束（0=关）")
-        target_group("单场最长", self.max_minutes, "分钟")
-
-        tips = ttk.Label(top, text="‘本场正常结束’：1 血并暂停新攻击，随后继续下一场。"
-                                   "‘暂时停止’：收尾回主界面，保留计数等待恢复。‘终止并退出’：关闭浏览器。\n"
-                                   "免费用尽后可用银币续打；绝技、加速等鱼翅付费按钮不会自动点击。",
-                         font=FONT_S, foreground="#666", wraplength=1000)
-        tips.grid(row=5, column=0, sticky="w", pady=(8, 0))
-        top.bind("<Configure>", lambda e: tips.configure(wraplength=max(300, e.width - 20)))
+        task = ttk.Frame(left)
+        task.grid(row=0, column=0, sticky="ew")
+        self._build_task_controls(task)
+        self._build_game_controls(game)
 
         self.status = tk.StringVar(value="状态：未运行")
-        ttk.Label(self.root, textvariable=self.status, anchor="w", padding=(10, 5),
-                  background="#f0f0f0", font=FONT_B).pack(fill="x", pady=(6, 0))
+        status_label = ttk.Label(left, textvariable=self.status, anchor="w",
+                                 font=FONT_B, justify="left", wraplength=780)
+        status_label.grid(row=1, column=0, sticky="ew", pady=(10, 7))
+        left.bind("<Configure>", lambda e: status_label.configure(wraplength=max(300, e.width)))
 
-        panes = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, sashwidth=6, bd=0)
-        panes.pack(fill="both", expand=True)
-        frame = ttk.Frame(panes, padding=(10, 8, 0, 10))
-        sidebar = ttk.Frame(panes, padding=(4, 8, 10, 10))
-        panes.add(frame, minsize=520, stretch="always")
-        panes.add(sidebar, minsize=260, width=275, stretch="never")
-        self.combat_widgets.build_effects(sidebar)
-        self.text = tk.Text(frame, wrap="word", height=22, font=("Consolas", 10))
-        sb = ttk.Scrollbar(frame, command=self.text.yview)
+        log_frame = ttk.Frame(left)
+        log_frame.grid(row=2, column=0, sticky="nsew")
+        self.text = tk.Text(log_frame, wrap="word", height=22, width=1, font=("Consolas", 10))
+        sb = ttk.Scrollbar(log_frame, command=self.text.yview)
         self.text.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.text.pack(side="left", fill="both", expand=True)
         for tag, color in (("warn", "#ef6c00"), ("error", "#c62828"),
                            ("win", "#2e7d32"), ("dim", "#888")):
             self.text.tag_config(tag, foreground=color)
+
+    def _build_task_controls(self, parent):
+        parent.columnconfigure(0, weight=1)
+        header = ttk.Frame(parent)
+        header.grid(row=0, column=0, sticky="ew")
+        self.rid = tk.StringVar(value=botmod.DEFAULT_RID)
+        self.rounds = tk.StringVar(value="0")
+        self.gap_min = tk.StringVar(value="5")
+        self.gap_max = tk.StringVar(value="15")
+
+        def field(row, title, var, width=5, suffix=""):
+            group = ttk.Frame(row)
+            group.pack(side="left", padx=(0, 12))
+            ttk.Label(group, text=title, font=FONT).pack(side="left")
+            ttk.Entry(group, textvariable=var, width=width, font=FONT).pack(side="left", padx=(4, 3))
+            if suffix:
+                ttk.Label(group, text=suffix, font=FONT_S, foreground="#666").pack(side="left")
+            return group
+
+        field(header, "房间号", self.rid, 8)
+        field(header, "场数", self.rounds, 4, "0=不限")
+        gap = field(header, "场间等待", self.gap_min, 4)
+        ttk.Label(gap, text="~", font=FONT).pack(side="left")
+        ttk.Entry(gap, textvariable=self.gap_max, width=4, font=FONT).pack(side="left", padx=3)
+        ttk.Label(gap, text="秒", font=FONT_S, foreground="#666").pack(side="left")
+        ttk.Button(header, text="打开数据目录", command=self.open_dir).pack(side="right")
+        ttk.Button(header, text="登录斗鱼", command=self.login).pack(side="right", padx=(0, 6))
+
+        actions = ttk.Frame(parent)
+        actions.grid(row=1, column=0, sticky="ew", pady=(8, 7))
+        ttk.Style(self.root).configure("Run.TButton", font=FONT_B, padding=(5, 3))
+        buttons = (("start_btn", "开始挂机", self.start, "normal"),
+                   ("end_btn", "本场正常结束", self.end_current, "disabled"),
+                   ("pause_btn", "暂时停止", self.pause_or_resume, "disabled"),
+                   ("stop_btn", "终止并退出", self.stop, "disabled"))
+        for column, (name, text, command, state) in enumerate(buttons):
+            actions.columnconfigure(column, weight=1, uniform="actions")
+            button = ttk.Button(actions, text=text, command=command, state=state, style="Run.TButton")
+            button.grid(row=0, column=column, sticky="ew", padx=(0, 6 if column < 3 else 0))
+            setattr(self, name, button)
+
+        targets = ttk.Frame(parent)
+        targets.grid(row=2, column=0, sticky="w")
+        self.stop_stage = tk.StringVar(value="0")
+        self.advance_stages = tk.StringVar(value="0")
+        self.max_minutes = tk.StringVar(value="13")
+        field(targets, "固定关卡", self.stop_stage, 5, "关")
+        field(targets, "推进", self.advance_stages, 5, "关")
+        field(targets, "单场最长", self.max_minutes, 5, "分钟")
+        ttk.Label(targets, text="关卡目标 0=关闭", font=FONT_S, foreground="#666").pack(side="left")
+
+        options = ttk.Frame(parent)
+        options.grid(row=3, column=0, sticky="w", pady=(7, 0))
+        self.headless_var = tk.BooleanVar(value=False)
+        self.coin_var = tk.BooleanVar(value=True)
+        self.finish_fast_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(options, text="隐藏浏览器", variable=self.headless_var).pack(side="left", padx=(0, 16))
+        ttk.Checkbutton(options, text="免费用尽后银币续打", variable=self.coin_var).pack(side="left", padx=(0, 16))
+        ttk.Checkbutton(options, text="尽快完成", variable=self.finish_fast_var,
+                        command=self._runtime_options_changed).pack(side="left")
+
+    def _build_game_controls(self, parent):
+        hp = ttk.Frame(parent)
+        hp.pack(anchor="w", pady=(0, 9))
+        self.hp_var = tk.BooleanVar(value=True)
+        self.hp_threshold = tk.StringVar(value="5")
+        ttk.Checkbutton(hp, text="血量低于", variable=self.hp_var,
+                        command=self._runtime_options_changed).pack(side="left")
+        hp_entry = ttk.Entry(hp, textvariable=self.hp_threshold, width=4, font=FONT)
+        hp_entry.pack(side="left", padx=3)
+        hp_entry.bind("<Return>", lambda _e: self._runtime_options_changed())
+        hp_entry.bind("<FocusOut>", lambda _e: self._runtime_options_changed())
+        ttk.Label(hp, text="滴回满", font=FONT_S, foreground="#666").pack(side="left")
+
+        damage = ttk.Frame(parent)
+        damage.pack(anchor="w", pady=(0, 9))
+        self.one_hit_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(damage, text="秒杀", variable=self.one_hit_var,
+                        command=self._runtime_options_changed).pack(side="left")
+        self.one_hit_mode = tk.StringVar(value="全额秒杀")
+        self._last_one_hit_mode = "full"
+        self.one_hit_mode_box = ttk.Combobox(
+            damage, textvariable=self.one_hit_mode, width=10, state="readonly",
+            values=[label for label, _ in ONE_HIT_MODE_LABELS], font=FONT)
+        self.one_hit_mode_box.pack(side="left", padx=(4, 4))
+        self.one_hit_mode_box.bind("<<ComboboxSelected>>", self._one_hit_mode_changed)
+        self.one_hit_value = tk.StringVar(value="50")
+        self.one_hit_value_entry = ttk.Entry(damage, textvariable=self.one_hit_value, width=7, font=FONT)
+        self.one_hit_value_entry.pack(side="left", padx=(0, 2))
+        self.one_hit_value_entry.bind("<Return>", lambda _e: self._runtime_options_changed())
+        self.one_hit_value_entry.bind("<FocusOut>", lambda _e: self._runtime_options_changed())
+        self.one_hit_unit = ttk.Label(damage, text="", font=FONT_S, foreground="#666", width=2)
+        self.one_hit_unit.pack(side="left")
+        self._update_one_hit_mode_ui()
+
+        self.combat_widgets = CombatWidgets(self.root, self._combat_controls_changed, FONT, FONT_S)
+        self.combat_widgets.build_speed(parent)
+        self.combat_widgets.build_effects(parent)
 
     # ---------- 配置（只在 GUI 线程读写 tkinter 变量） ----------
     def _config_vars(self):
