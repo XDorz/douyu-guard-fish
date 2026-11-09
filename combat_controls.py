@@ -166,7 +166,8 @@ JS_COMBAT_INSTALL = r"""
   const now = loop => Number(loop.lastTickTime) || 0;
   function stageOf(loop) {
     const match = /^stage-(\d+)(?:-|$)/.exec(String(loop.config && loop.config.configHash || ''));
-    const n = match ? Number(match[1]) : Number((window.__WM && window.__WM.stage || {}).curStage);
+    const n = match ? Number(match[1]) : Number(GF.observedStage ||
+      (window.__WM && window.__WM.stage || {}).curStage);
     return Number.isInteger(n) && n > 0 ? n : null;
   }
   function markStage(loop, meta) {

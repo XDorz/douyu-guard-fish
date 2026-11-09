@@ -21,7 +21,7 @@ LOG_Q = queue.Queue()
 FONT = ("Microsoft YaHei UI", 10)
 FONT_B = ("Microsoft YaHei UI", 10, "bold")
 FONT_S = ("Microsoft YaHei UI", 9)
-ONE_HIT_MODE_LABELS = (("全额秒杀", "full"), ("概率秒杀", "probability"),
+ONE_HIT_MODE_LABELS = (("全额秒杀", "full"), ("温和伤害", "gentle"), ("概率秒杀", "probability"),
                        ("攻击倍率", "multiplier"), ("攻击力固定", "fixed_attack"))
 ONE_HIT_MODE_KEYS = {label: key for label, key in ONE_HIT_MODE_LABELS}
 
@@ -161,8 +161,16 @@ class App:
         ttk.Checkbutton(options, text="免费用尽后银币续打", variable=self.coin_var).pack(side="left", padx=(0, 16))
         ttk.Checkbutton(options, text="尽快完成", variable=self.finish_fast_var,
                         command=self._runtime_options_changed).pack(side="left")
+        rest = ttk.Frame(parent)
+        rest.grid(row=4, column=0, sticky="w", pady=(7, 0))
+        self.daily_limit_min = tk.StringVar(value="240")
+        self.rest_min = tk.StringVar(value="90")
+        self.random_skills_var = tk.BooleanVar(value=True)
+        field(rest, "活跃满", self.daily_limit_min, 4, "分，0=关")
+        field(rest, "休息", self.rest_min, 4, "分")
+        ttk.Checkbutton(rest, text="一键随机选技", variable=self.random_skills_var).pack(side="left")
         tools = ttk.Frame(parent)
-        tools.grid(row=4, column=0, sticky="w", pady=(10, 0))
+        tools.grid(row=5, column=0, sticky="w", pady=(10, 0))
         ttk.Button(tools, text="登录斗鱼", command=self.login).pack(side="left", padx=(0, 6))
         ttk.Button(tools, text="打开数据目录", command=self.open_dir).pack(side="left")
         tips = ttk.Label(parent, text="本场正常结束：收尾本场，随后继续下一场。\n"
@@ -171,7 +179,7 @@ class App:
                          "尽快完成：每场开局后自动收尾，用于完成每日次数。\n"
                          "API 变动暂停：撤销覆盖并保留浏览器，查看日志报告。",
                          font=FONT_S, foreground="#666", justify="left", wraplength=440)
-        tips.grid(row=5, column=0, sticky="w", pady=(14, 0))
+        tips.grid(row=6, column=0, sticky="w", pady=(10, 0))
 
     def _build_game_controls(self, parent):
         common = ttk.Frame(parent)
@@ -225,6 +233,8 @@ class App:
             "one_hit": self.one_hit_var, "headless": self.headless_var,
             "stop_stage": self.stop_stage, "advance_stages": self.advance_stages,
             "max_minutes": self.max_minutes,
+            "daily_limit_min": self.daily_limit_min, "rest_min": self.rest_min,
+            "random_skills": self.random_skills_var,
         }
 
     def _load_config(self):
@@ -457,6 +467,8 @@ class App:
             advance_stages = int((self.advance_stages.get() or "0").strip() or 0)
             max_minutes = float((self.max_minutes.get() or "13").strip() or 13)
             one_hit_mode, one_hit_probability, attack_multiplier, attack_fixed = self._one_hit_values()
+            daily_limit = float(self.daily_limit_min.get())
+            rest_minutes = float(self.rest_min.get())
         except ValueError:
             messagebox.showwarning("输入错误", "房间号/场数/等待时间/回血阈值/关卡目标/时限/秒杀参数格式不对")
             return
@@ -468,6 +480,9 @@ class App:
             return
         if max_minutes <= 0:
             messagebox.showwarning("输入错误", "单场最长时间必须大于 0 分钟")
+            return
+        if not (0 <= daily_limit < float('inf') and 1 <= rest_minutes < float('inf')):
+            messagebox.showwarning("输入错误", "活跃限制需为非负数（0=关闭），休息至少 1 分钟")
             return
         if one_hit_mode == "probability" and not 0 <= one_hit_probability <= 100:
             messagebox.showwarning("输入错误", "概率秒杀必须填写 0~100%")
@@ -521,7 +536,8 @@ class App:
                                              stop_stage, advance_stages,
                                              one_hit_mode, one_hit_probability,
                                              attack_multiplier, attack_fixed,
-                                             self.finish_fast_var.get()),
+                                             self.finish_fast_var.get(), daily_limit, rest_minutes,
+                                             self.random_skills_var.get(), self._settings['block_stats']),
                                        daemon=True)
         self.thread.start()
 
@@ -529,7 +545,8 @@ class App:
              one_hit=False, max_battle_seconds=botmod.MAX_BATTLE_SECONDS,
              stop_stage=0, advance_stages=0, one_hit_mode="full",
              one_hit_probability=50.0, attack_multiplier=2.0,
-             attack_fixed=100000.0, finish_fast=False):
+             attack_fixed=100000.0, finish_fast=False, daily_limit_min=240, rest_min=90,
+             random_skills=True, block_stats=True):
         try:
             self.bot = botmod.GuardFishBot(rid=rid, rounds=rounds, gap_min=gap_min,
                                            gap_max=gap_max, headless=headless,
@@ -544,7 +561,9 @@ class App:
                                            attack_fixed=attack_fixed,
                                            finish_fast=finish_fast,
                                            debug=self.debug, pause_on_timeout=True,
-                                           combat_controls=self._desired_combat)
+                                           combat_controls=self._desired_combat,
+                                           daily_limit_min=daily_limit_min, rest_min=rest_min,
+                                           random_skills=random_skills, block_stats=block_stats)
             # 如果用户在工作线程刚启动的瞬间点击了复选框，以当前 GUI 值为准。
             self.bot.set_runtime_controls(hp_guard=self._desired_hp_guard,
                                           one_hit=self._desired_one_hit,
@@ -578,13 +597,15 @@ class App:
         if self.running:
             messagebox.showinfo("提示", "挂机运行中，请先停止再登录")
             return
-        self._log("[系统] 正在打开登录窗口（登录完成后直接关掉浏览器窗口即可）…")
+        self._log("[系统] 正在打开登录窗口，扫码后请等游戏登录确认…")
+        login_rid = self.rid.get() or botmod.DEFAULT_RID
 
         def run():
             msg, tag = None, "dim"
             try:
-                botmod.open_login(self.rid.get() or botmod.DEFAULT_RID)
-                msg = "[系统] 登录窗口已关闭。"
+                logged = botmod.open_login(login_rid, on_log=lambda line, level="info": LOG_Q.put((line, level)))
+                msg = "[系统] 登录已确认并保存。" if logged else "[系统] 未能确认登录，请重试。"
+                tag = "dim" if logged else "warn"
             except Exception as e:
                 msg, tag = "[异常] 登录失败：%s" % e, "error"
             self.root.after(0, lambda m=msg, t=tag: self._log(m, t))

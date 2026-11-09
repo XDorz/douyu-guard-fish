@@ -6,9 +6,11 @@ rem 打包需完整版 Python（自带 tkinter）；embeddable/精简版 Python 
 set PY=python
 where python >nul 2>nul || set PY=py
 
-rem spec 会导入 playwright 并把其 driver 一起打包，首次构建需同时安装两者
-"%PY%" -m pip install --quiet playwright pyinstaller
+rem spec 会打包 Patchright driver；使用与 Actions 相同的依赖版本
+"%PY%" -m pip install --quiet -r requirements.txt pyinstaller
+if errorlevel 1 exit /b 1
 "%PY%" -m PyInstaller --noconfirm --distpath "保卫鱼娘自动挂机" --workpath "_build_tmp" yu_gui.spec
+if errorlevel 1 exit /b 1
 if exist "_build_tmp" rd /s /q "_build_tmp" 2>nul
 
 echo.

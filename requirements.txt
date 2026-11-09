@@ -1,0 +1,2 @@
+# 主世界执行参数随版本变化；与 browser_compat.py 的本地 Chromium 验证一致。
+patchright==1.64.4

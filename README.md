@@ -80,16 +80,37 @@ CLI 保留雷/火/冰的人工 CD 参数以兼容旧调用，GUI 仅提供风系
 固定暴伤 0–100 倍、冰冻/土系时长 0.1–180 游戏秒、减速幅度 0–100%。倍率输入为 0–100，
 最终值也按上述边界修正。冰冻时长不设为 0，避免原生计时器不处理零值而残留冰冻标记。
 
+## 上游 v1.0.17 合并（本分支 v1.4.0）
+
+合入 2026-11-02、2026-11-05 的上游提交，保留本分支 GUI、实时覆盖、API 变动暂停、
+Debug、每日场数和真实结算计数。具体取舍见 [合并记录](docs/upstream-merge-20261109.md)。
+
+- 默认采用 Patchright，明确在页面主世界执行引擎控制与撤销；状态直接从响应回调获取，
+  不再包装游戏的 fetch / XMLHttpRequest。无头 UA 只移除 HeadlessChrome，保留实际平台和版本。
+- 开启挑战使用滚轮与曲线鼠标移动，保留付费按钮拦截；选卡/结算动作等待增加随机变化。
+- 新增「一键随机选技」开关，默认开启；只正向识别免费随机按钮。关闭后沿用评分选卡。
+- 左侧「活跃满」默认 240 分钟，「休息」默认 90 分钟；限额填 0 可关闭。
+  只在回到主界面、还有剩余场次时休息，暂停时间不计入活跃，休息结束继续原场数。
+  计时和休息截止时间存入 `active_state.json`，跨天重置活跃时间，完成休息也重新累计。
+- 秒杀策略新增「温和伤害」：12% 概率击杀，其余命中造成当前血量的 55–90%（取整且至少 1）。
+  原有策略与回血保持独立，旧配置不自动改成温和模式；没有账号风险降低的线上验证。
+- 场间有 12% 概率追加 40–150 秒休息；「尽快完成」时不追加，活跃休息仍按用户设置执行。
+- 默认只拦截 `dotserver.douyucdn.cn/fish3/1.gif`；`/actgame/` 业务上报完整保留。
+  可在 `config.json` 设 `block_stats: false` 或 CLI 加 `--no-block-stats` 关闭。
+
+CLI 对应 `--daily-limit 240 --rest-min 90`、`--no-random-skills`、
+`--one-hit --one-hit-mode gentle`。这些是具体的兼容和行为调整，不构成不会封号的保证。
+
 ## 从源码运行
 
 ```bash
-python -m pip install playwright
+python -m pip install -r requirements.txt
 python yu_gui.py            # 图形界面
 python bot.py --run --rounds 1   # 命令行
 ```
 
 需要系统 Python 3.11+（打包用的 GUI 依赖 tkinter，需完整版 Python）。打包脚本会自动安装
-`playwright` 和 `pyinstaller`；不需要执行 `playwright install`，程序会复用本机 Chrome/Edge。
+`requirements.txt` 中的 Patchright 和 `pyinstaller`；不需要下载配套浏览器，程序会复用本机 Chrome/Edge。
 
 ## 打包
 
@@ -108,12 +129,12 @@ GitHub runner 无需安装 Chrome，运行时仍使用用户电脑上的 Chrome/
 本地打包 Debug 版：在运行打包命令前设置 `GUARD_FISH_BUILD_FLAVOR=debug`，产物为
 `保卫鱼娘助手-Debug.exe`。从源码启动可运行 `python yu_debug.py` 或 `python yu_gui.py --debug`。
 
-Playwright 官方没有 PyInstaller hook，`yu_gui.spec` 里手动把 `site-packages/playwright/driver`（node.exe + cli.js，约 102MB）打进了包。
+`yu_gui.spec` 将 `patchright/driver`、版本文件与 API 基准一起打进单文件 EXE。源码在未安装 Patchright 时可回退 Playwright；发行 EXE 固定携带 Patchright，避免混用两个驱动。
 
 ## 项目结构
 
 ```
-bot.py                    核心：Playwright 驱动 + 页面状态机 + 自动决策
+bot.py                    核心：Patchright / Playwright 驱动 + 页面状态机 + 自动决策
 yu_gui.py                 桌面 GUI + CLI 入口
 yu_debug.py               Debug GUI 入口
 diagnostics.py            只读引擎采集与诊断文件

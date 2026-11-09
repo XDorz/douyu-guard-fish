@@ -1,17 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""保卫鱼娘挂机助手 · PyInstaller 打包配置（单文件 exe，含 Playwright driver）"""
+"""保卫鱼娘挂机助手 · 单文件 EXE，含 Patchright driver。"""
 import os
-import playwright
+import patchright
 
 IS_DEBUG_BUILD = os.environ.get("GUARD_FISH_BUILD_FLAVOR") == "debug"
 ENTRY = "yu_debug.py" if IS_DEBUG_BUILD else "yu_gui.py"
 EXE_NAME = "保卫鱼娘助手-Debug" if IS_DEBUG_BUILD else "保卫鱼娘助手"
-PW_DIR = os.path.dirname(playwright.__file__)
+PW_DIR = os.path.dirname(patchright.__file__)
 DRIVER = os.path.join(PW_DIR, "driver")          # node.exe + package/cli.js（约 100MB）
 
-datas = [(DRIVER, os.path.join("playwright", "driver")), ("VERSION", "."),
+datas = [(DRIVER, os.path.join("patchright", "driver")), ("VERSION", "."),
          ("api_baseline.json", ".")]
-hiddenimports = ["playwright", "playwright.sync_api", "playwright.async_api", "greenlet"]
+hiddenimports = ["patchright", "patchright.sync_api", "patchright.async_api", "greenlet"]
 
 a = Analysis(
     [ENTRY],
@@ -22,7 +22,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["matplotlib", "numpy", "pandas", "PIL", "scipy", "pytest",
+    excludes=["playwright", "matplotlib", "numpy", "pandas", "PIL", "scipy", "pytest",
               "IPython", "notebook", "tkinter.test"],
     noarchive=False,
 )

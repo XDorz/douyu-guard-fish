@@ -17,6 +17,8 @@ run.log
 selftest.txt
 config.json
 .config-*.tmp
+active_state.json
+active_state.json.tmp
 
 # 打包产物走 Release，不进仓库
 保卫鱼娘自动挂机/

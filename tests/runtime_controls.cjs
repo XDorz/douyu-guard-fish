@@ -44,7 +44,7 @@ function harness() {
 }
 
 // All strategies, including an initially unloaded damage hook, must yield to ending.
-for (const mode of ['off', 'full', 'probability', 'multiplier']) {
+for (const mode of ['off', 'full', 'probability', 'multiplier', 'gentle']) {
   const h = harness();
   h.run('cfg', {hpGuard: true, oneHit: mode !== 'off', oneHitMode: mode,
                 oneHitProbability: 100, attackMultiplier: 10});
@@ -86,6 +86,25 @@ for (const mode of ['off', 'full', 'probability', 'multiplier']) {
     assert.equal(Object.hasOwn(loop, '_dealDamage'), false);
   }
   assert.equal(h.window.__GF, undefined);
+}
+
+// Upstream gentle damage remains optional and does not implicitly enable healing.
+{
+  const h = harness();
+  h.run('cfg', {hpGuard: false, oneHit: true, oneHitMode: 'gentle'});
+  h.tick();
+  h.loop.coreHp = 2;
+  for (const [random, expected] of [[0.1, 1000], [0.5, 725], [0.99, 896]]) {
+    h.math.random = () => random;
+    h.loop._dealDamage({currentHp: 1000}, 1, 'card', false);
+    assert.equal(h.loop.calls.at(-1)[0], expected);
+  }
+  h.tick();
+  assert.equal(h.loop.coreHp, 2);
+  h.run('cfg', {oneHit: false});
+  h.tick();
+  h.loop._dealDamage({currentHp: 1000}, 33);
+  assert.equal(h.loop.calls.at(-1)[0], 33);
 }
 
 // A request before engine discovery remains pending and takes effect once available.

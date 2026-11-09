@@ -26,6 +26,8 @@ import threading
 import traceback
 import datetime
 from urllib.parse import urlsplit
+from browser_compat import pick_driver, evaluate_main, fix_headless_ua, NetworkState, GIF_1PX, is_stats_beacon
+from activity_budget import ActivityBudget
 from stage_timing import StageTimer, api_stage
 from daily_tasks import DailyChallenge, JS_DAILY_TASK_QUERY
 from diagnostics import DebugRecorder, JS_ENGINE_SNAPSHOT, safe_api_data, safe_api_request_data
@@ -42,6 +44,17 @@ except OSError:
 DEFAULT_RID = "12306"
 GAME_URL = "https://www.douyu.com/pages/vibe-lab-act202606-game/mine?rid={rid}&isAnchorSide=0"
 HOME_URL = "https://www.douyu.com/"
+
+def usleep(sec, ratio=0.25, lo=0.05):
+    """带抖动的等待。阈值 lo 很重要：低于 50ms 的等待不动，避免破坏库内部时序。"""
+    try:
+        v = float(sec)
+    except Exception:
+        return
+    if v <= 0:
+        return
+    time.sleep(max(lo, v + random.uniform(-ratio, ratio) * v))
+
 
 MAX_BATTLE_SECONDS = 13 * 60      # 默认单场监控时限，GUI / CLI 可调整
 END_GRACE_SECONDS = 3 * 60         # 请求自然结束后等待结算的宽限时间（场上可能暂时没有接近基地的敌人）
@@ -261,6 +274,11 @@ def launch_persistent(pw, user_data_dir, headless=False):
                         except Exception:
                             pass
                         raise RuntimeError("context 启动后不可用（可能被已有浏览器实例接管）")
+                    if headless:
+                        try:
+                            fix_headless_ua(ctx)
+                        except Exception as exc:
+                            log_msg("无头浏览器 UA 适配失败：%s" % str(exc)[:120])
                     return ctx, exe
                 except Exception as e:
                     errs.append("%s(%s) 第%d次: %s" % (name, os.path.basename(exe), attempt, str(e)[:120]))
@@ -351,11 +369,17 @@ JS_HP_WATCH = r"""
       const starts = [];
       for (const id of Object.keys(roots)) { const fr = roots[id]; if (fr && fr.current) starts.push(fr.current); }
       if (!starts.length) {
-        const el = document.querySelector('[class*="GameHUD-module_container"], [class*="CardLanes"], canvas');
-        if (el) {
-          const k = Object.keys(el).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
-          if (k) { let f = el[k]; while (f && f.return) f = f.return; if (f) starts.push(f); }
+        const keyOf = el => Object.keys(el).find(k =>
+          k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+        let el = document.querySelector('[class*="GameHUD-module_container"], [class*="CardLanes"], canvas');
+        let k = el && keyOf(el);
+        if (!k && typeof document.querySelectorAll === 'function') {
+          for (const candidate of document.querySelectorAll('*')) {
+            const key = keyOf(candidate);
+            if (key) { el = candidate; k = key; break; }
+          }
         }
+        if (el && k) { let f = el[k]; while (f && f.return) f = f.return; if (f) starts.push(f); }
       }
       let best = null, bestScore = 0, bestName = '', bestKind = '';
       const seen = new Set();
@@ -443,7 +467,12 @@ JS_HP_WATCH = r"""
           nextDamage = 1 + Math.floor(Math.random() * 100);
         } else if (GF.oneHit && enemy && typeof enemy.currentHp === 'number' && enemy.currentHp > 0) {
           const mode = GF.oneHitMode || 'full';
-          if (mode === 'multiplier') {
+          if (mode === 'gentle') {
+            const lethal = Math.random() < 0.12;
+            nextDamage = lethal ? enemy.currentHp :
+              Math.max(1, Math.floor(enemy.currentHp * (0.55 + Math.random() * 0.35)));
+            if (nextDamage >= enemy.currentHp) GF.oneHitKills++;
+          } else if (mode === 'multiplier') {
             const mult = Math.max(0.01, Number(GF.attackMultiplier) || 1);
             nextDamage = Math.max(1, Math.floor((Number(damage) || 0) * mult));
             if (nextDamage >= enemy.currentHp) GF.oneHitKills++;
@@ -597,7 +626,7 @@ JS_HP_CFG = r"""
   if (cfg && cfg.oneHit !== undefined) window.__GF.oneHit = !!cfg.oneHit;
   if (cfg && cfg.oneHitMode !== undefined) {
     const mode = String(cfg.oneHitMode || 'full');
-    window.__GF.oneHitMode = ['full', 'probability', 'multiplier', 'fixed_attack'].indexOf(mode) >= 0 ? mode : 'full';
+    window.__GF.oneHitMode = ['full', 'probability', 'multiplier', 'fixed_attack', 'gentle'].indexOf(mode) >= 0 ? mode : 'full';
   }
   if (cfg && cfg.oneHitProbability !== undefined)
     window.__GF.oneHitProbability = Math.max(0, Math.min(100, Number(cfg.oneHitProbability) || 0));
@@ -665,60 +694,10 @@ JS_HP_DRAIN = r"""
 }
 """
 
-JS_HOOK = r"""
-(() => {
-  if (window.__WM) return;
-  const W = window.__WM = {panelInfo:null, battleInfo:null, stage:null, maxStage:0,
-                          freeNum:null, battleRound:null, battleSkill:null, battleOver:false, last:null, respCount:0};
-  const pick = (url, j) => {
-    try {
-      const d = j && j.data || {};
-      W.last = {url: url, t: Date.now(), body: j};
-      W.respCount++;
-      if (url.indexOf('basics/panelInfo') >= 0) W.panelInfo = j;
-      if (url.indexOf('game/battleInfo') >= 0) W.battleInfo = j;
-      if (d.userInfo && d.userInfo.freeNum != null) W.freeNum = d.userInfo.freeNum;
-      if (d.userInfo && d.userInfo.battleRound != null) W.battleRound = d.userInfo.battleRound;
-      if (d.battleInfo && d.battleInfo.curStage != null) {
-        W.stage = {curStage: d.battleInfo.curStage, curHp: d.battleInfo.baseHp, t: Date.now()};
-        W.maxStage = Math.max(W.maxStage || 0, d.battleInfo.curStage);
-      }
-      if (d.stageInfo) {
-        W.stage = {curStage: d.stageInfo.curStage, curHp: d.stageInfo.curHp, t: Date.now()};
-        W.maxStage = Math.max(W.maxStage || 0, d.stageInfo.curStage);
-      }
-      if (d.battleSkill) W.battleSkill = d.battleSkill;
-      if (d.status === 20) W.battleOver = true;
-      if (d.status === 10) W.battleOver = false;
-    } catch (e) {}
-  };
-  const of = window.fetch;
-  window.fetch = function() {
-    const args = arguments;
-    return of.apply(this, args).then(resp => {
-      try {
-        const u = (typeof args[0] === 'string') ? args[0] : ((args[0] && args[0].url) || '');
-        if (u.indexOf('/actgame/') >= 0) { resp.clone().json().then(j => pick(u, j)).catch(()=>{}); }
-      } catch (e) {}
-      return resp;
-    });
-  };
-  const oo = XMLHttpRequest.prototype.open;
-  const osend = XMLHttpRequest.prototype.send;
-  XMLHttpRequest.prototype.open = function(m, u) { this.__u = u; return oo.apply(this, arguments); };
-  XMLHttpRequest.prototype.send = function() {
-    this.addEventListener('load', () => {
-      try {
-        if ((this.__u||'').indexOf('/actgame/') >= 0) pick(this.__u, JSON.parse(this.responseText));
-      } catch (e) {}
-    });
-    return osend.apply(this, arguments);
-  };
-})()
-"""
-
 JS_STATE = r"""
-(() => {
+(observedStage) => {
+  if (window.__GF && observedStage && observedStage.curStage != null)
+    window.__GF.observedStage = Number(observedStage.curStage);
   const q = s => document.querySelector(s);
   const vis = el => { if (!el) return false; const r = el.getBoundingClientRect();
     const st = getComputedStyle(el);
@@ -783,7 +762,7 @@ JS_STATE = r"""
     out.coinDom = ct ? (ct.innerText || '').trim() : null;
   } catch (e) { out.coinDom = null; }
   return out;
-})()
+}
 """
 
 JS_CLICK_CHALLENGE = r"""
@@ -803,6 +782,46 @@ JS_CLICK_SKILL = r"""
   c.click(); return (c.innerText || '').trim().slice(0, 60);
 }
 """
+
+JS_CLICK_RANDOM_SKILL = r"""
+() => {
+  const vis = el => { if (!el) return false; const r = el.getBoundingClientRect();
+    const s = getComputedStyle(el);
+    return r.width > 1 && r.height > 1 && s.display !== 'none' && s.visibility !== 'hidden'; };
+  const bgOf = el => { try { return getComputedStyle(el).backgroundImage || ''; } catch (e) { return ''; } };
+
+  const isAuto = el => {
+    const cls = String(el.className || '');
+    const bg = bgOf(el);
+    return /Starter-module_auto/.test(cls) || /refresh-auto/i.test(bg);
+  };
+
+  // 只在技能面板范围内找，缩小误判面
+  const scope = document.querySelector('[class*="Starter-module_skillsPanel"]')
+             || document.querySelector('[class*="SkillPanel-module_panel"]')
+             || document.body;
+
+  let btn = null;
+  for (const el of scope.querySelectorAll('button, [role="button"]')) {
+    if (vis(el) && isAuto(el)) { btn = el; break; }
+  }
+  if (!btn) {
+    for (const el of document.querySelectorAll('button')) {
+      if (vis(el) && isAuto(el)) { btn = el; break; }
+    }
+  }
+  if (!btn) return {ok: false, why: 'no-auto-btn'};
+
+  // 正向再确认一次，避免任何情况下点到「刷新」
+  if (!isAuto(btn)) return {ok: false, why: 'guard'};
+  const bg = bgOf(btn);
+  if (/refresh-/i.test(bg) && !/refresh-auto/i.test(bg)) return {ok: false, why: 'guard-refresh'};
+
+  try { btn.click(); } catch (e) { return {ok: false, why: 'click-threw'}; }
+  return {ok: true, cls: String(btn.className || ''), img: bg.slice(-40)};
+}
+"""
+
 
 JS_CLICK_FINAL_START = r"""
 () => {
@@ -972,7 +991,7 @@ def score_skill_text(txt):
     return 300
 
 
-ONE_HIT_MODES = {"full", "probability", "multiplier", "fixed_attack"}
+ONE_HIT_MODES = {"full", "probability", "multiplier", "fixed_attack", "gentle"}
 
 
 def normalize_one_hit_mode(mode):
@@ -982,6 +1001,8 @@ def normalize_one_hit_mode(mode):
 
 def one_hit_mode_text(mode, probability=50.0, multiplier=2.0, attack_fixed=100000.0):
     mode = normalize_one_hit_mode(mode)
+    if mode == "gentle":
+        return "温和伤害（12% 秒杀，其余扣 55~90% 当前血量）"
     if mode == "probability":
         return "概率 %.1f%%" % float(probability)
     if mode == "multiplier":
@@ -999,7 +1020,15 @@ class GuardFishBot:
                  max_battle_seconds=MAX_BATTLE_SECONDS, stop_stage=0,
                  advance_stages=0, one_hit_mode="full",
                  one_hit_probability=50.0, attack_multiplier=2.0, attack_fixed=100000.0,
-                 finish_fast=False, debug=False, pause_on_timeout=False, combat_controls=None):
+                 finish_fast=False, debug=False, pause_on_timeout=False, combat_controls=None,
+                 daily_limit_min=240, rest_min=90, random_skills=True, block_stats=True):
+        self._network = NetworkState()
+        self._activity = ActivityBudget(os.path.join(DATA_DIR, "active_state.json"))
+        self.daily_limit_min = max(0.0, float(daily_limit_min))
+        self.rest_min = max(1.0, float(rest_min))
+        self.random_skills = bool(random_skills)
+        self.block_stats = bool(block_stats)
+        self._stats_blocked = 0
         self.rid = str(rid)
         self.rounds = int(rounds)
         self.gap_min = float(gap_min or 0)
@@ -1159,6 +1188,8 @@ class GuardFishBot:
             requested = self._pause_requested
         if not requested or self._stop.is_set():
             return not self._stop.is_set()
+        activity_running = self._activity.started is not None
+        self._activity.stop()
         self._api_monitor.suspend()
         self._unload_runtime_script()
         with self._control_lock:
@@ -1182,6 +1213,8 @@ class GuardFishBot:
             self._natural_end_sent = False
         if self._stop.is_set():
             return False
+        if activity_running:
+            self._activity.start()
         self.status["state"] = "恢复监控" if unfinished else "准备开局"
         self._debug_write("resumed", unfinished=unfinished, rounds_done=self.rounds_done)
         self._log("已恢复挂机，继续%s（已完成 %d 场）。" %
@@ -1267,14 +1300,25 @@ class GuardFishBot:
             t.join(timeout=8)
 
     # -------- 浏览器 --------
+    def _eval(self, script, *args):
+        return evaluate_main(self._page, script, *args)
+
+    def _on_stats_beacon(self, route):
+        # 仅承接上游的精确统计 GIF 路径，业务接口照常上报并接受 API 监控。
+        if is_stats_beacon(route.request.url):
+            route.fulfill(status=200, content_type='image/gif', body=GIF_1PX)
+            self._stats_blocked += 1
+        else:
+            route.continue_()
+
     def _ensure_browser(self):
         if self._ctx is not None and self._page is not None:
             try:
-                self._page.evaluate("1")
+                self._eval("1")
                 return
             except Exception:
                 self._close_browser()
-        from playwright.sync_api import sync_playwright
+        driver_name, sync_playwright, _timeout = pick_driver()
         if self._pw is None:
             self._pw = sync_playwright().start()
         kill_stale_chrome(PROFILE)
@@ -1282,11 +1326,9 @@ class GuardFishBot:
         ctx, exe = launch_persistent(self._pw, PROFILE, headless=self.headless)
         self._ctx = ctx
         self._page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        self._log("浏览器就绪：%s" % exe)
-        try:
-            self._page.add_init_script(JS_HOOK)
-        except Exception as e:
-            self._log("注入 hook 失败：%s" % str(e)[:120], "warn")
+        self._log("浏览器就绪：%s（驱动：%s）" % (exe, driver_name))
+        if self.block_stats:
+            ctx.route("**/fish3/1.gif*", self._on_stats_beacon)
         try:
             self._page.on("response", self._on_response)
             self._page.on("request", self._on_request)
@@ -1294,7 +1336,7 @@ class GuardFishBot:
             raise RuntimeError('无法安装 API 请求监控，停止挂机') from exc
         # 关闭付费「不再提示」标记（安全兜底）
         try:
-            cleared = self._page.evaluate(JS_CLEAR_NO_TIP)
+            cleared = self._eval(JS_CLEAR_NO_TIP)
             if cleared:
                 self._log("已清理付费免提示标记：%s" % cleared, "warn")
         except Exception:
@@ -1307,9 +1349,9 @@ class GuardFishBot:
         if self._runtime_script_loaded:
             return True
         try:
-            self._page.evaluate(FAKE_DEVTOOLS_HOOK)
-            self._page.evaluate(JS_HP_WATCH)
-            self._page.evaluate(JS_COMBAT_INSTALL)
+            self._eval(FAKE_DEVTOOLS_HOOK)
+            self._eval(JS_HP_WATCH)
+            self._eval(JS_COMBAT_INSTALL)
             self._runtime_epoch += 1
             self._runtime_script_loaded = True
             self._last_runtime_kills = 0
@@ -1325,7 +1367,7 @@ class GuardFishBot:
             return True
         self._collect_kills()
         try:
-            self._page.evaluate(JS_HP_UNLOAD)
+            self._eval(JS_HP_UNLOAD)
         except Exception as e:
             self._log("卸载回血/秒杀模块失败：%s" % str(e)[:120], "warn")
             return False
@@ -1358,7 +1400,7 @@ class GuardFishBot:
                 return None
             try:
                 if not natural_sent:
-                    self._page.evaluate(JS_HP_CFG, {
+                    self._eval(JS_HP_CFG, {
                         "hpGuard": False, "oneHit": False, "threshold": threshold,
                         "oneHitMode": one_hit_mode,
                         "oneHitProbability": one_hit_probability,
@@ -1367,7 +1409,7 @@ class GuardFishBot:
                         "discover": True, "monitor": True, "monitorEpoch": self._runtime_epoch,
                         "combat": default_controls(), "maxRefillMs": self.max_battle_seconds * 1000,
                     })
-                    r = self._page.evaluate(JS_HP_END)
+                    r = self._eval(JS_HP_END)
                     if isinstance(r, dict) and (r.get("ok") or r.get("pending")):
                         with self._control_lock:
                             self._natural_end_sent = True
@@ -1390,7 +1432,7 @@ class GuardFishBot:
                    attack_multiplier, attack_fixed, combat)
         if pending or force or self._runtime_applied != desired:
             try:
-                r = self._page.evaluate(JS_HP_CFG, {
+                r = self._eval(JS_HP_CFG, {
                     "hpGuard": hp_guard, "oneHit": one_hit, "threshold": threshold,
                     "oneHitMode": one_hit_mode, "oneHitProbability": one_hit_probability,
                     "attackMultiplier": attack_multiplier, "attackFixed": attack_fixed,
@@ -1473,7 +1515,7 @@ class GuardFishBot:
         self._debug_last_capture = now
         self._debug_last_stage = stage
         try:
-            snapshot = self._page.evaluate(JS_ENGINE_SNAPSHOT, {"sources": not self._debug_sources_collected})
+            snapshot = self._eval(JS_ENGINE_SNAPSHOT, {"sources": not self._debug_sources_collected})
             if isinstance(snapshot, dict) and snapshot.get("found"):
                 self._debug_sources_collected = True
             self._debug_write("engine_snapshot", monotonic_s=now, stage=stage,
@@ -1490,7 +1532,7 @@ class GuardFishBot:
     def _collect_kills(self):
         if self._page is not None and self._runtime_script_loaded:
             try:
-                self._kills.consume(self._page.evaluate(JS_COMBAT_SNAPSHOT))
+                self._kills.consume(self._eval(JS_COMBAT_SNAPSHOT))
             except Exception:
                 pass
 
@@ -1588,6 +1630,7 @@ class GuardFishBot:
             if body:
                 try:
                     j = json.loads(body)
+                    self._network.observe(api, j)
                     if api == "userTask/panelInfo":
                         self._daily.update_status(j)
                         self._sync_daily_status()
@@ -1677,7 +1720,7 @@ class GuardFishBot:
             return
         self._daily_next_query = now + 60
         try:
-            result = self._page.evaluate(JS_DAILY_TASK_QUERY,
+            result = self._eval(JS_DAILY_TASK_QUERY,
                                          {'rid': self.rid, 'config': not bool(self._daily.tasks)})
             if not isinstance(result, dict):
                 return
@@ -1694,7 +1737,7 @@ class GuardFishBot:
         if self._stop.is_set():
             return None
         try:
-            st = self._page.evaluate(JS_STATE)
+            st = self._network.merge(self._eval(JS_STATE, self._network.values.get('stage')))
             # evaluate 期间可能分派新的请求；暂停恢复后不能沿用暂停前的状态。
             if self._api_checkpoint():
                 return self._state()
@@ -1756,6 +1799,92 @@ class GuardFishBot:
         except Exception:
             pass
         return None
+
+    def _human_move(self, x, y, steps=None):
+        """沿二次贝塞尔曲线移动鼠标（带抖动），代替瞬移。
+
+        为什么：`mouse.move()` 一次性跳点，在 mousemove 事件序列上是
+        「一个点 → 另一个点」，与真人连续轨迹差异极大，且缺少时间分布。
+        这里按 8~18 段折线 + 每步 ±1.2px 抖动，并把总时长随机化到 180~420ms。
+        """
+        try:
+            cur = getattr(self, "_mouse_xy", None) or (random.randint(600, 900),
+                                                       random.randint(300, 500))
+            sx, sy = cur
+            if steps is None:
+                steps = random.randint(8, 18)
+            # 控制点：垂直于两点连线偏移，制造弧度
+            mx, my = (sx + x) / 2.0, (sy + y) / 2.0
+            dx, dy = x - sx, y - sy
+            dist = max(1.0, (dx * dx + dy * dy) ** 0.5)
+            off = random.uniform(-0.18, 0.18) * dist
+            cx, cy = mx - dy / dist * off, my + dx / dist * off
+            total = random.uniform(0.18, 0.42)
+            for i in range(1, steps + 1):
+                if self._stop.is_set() or self._paused or self._api_monitor.pending:
+                    return
+                t = i / float(steps)
+                bx = (1 - t) ** 2 * sx + 2 * (1 - t) * t * cx + t * t * x
+                by = (1 - t) ** 2 * sy + 2 * (1 - t) * t * cy + t * t * y
+                bx += random.uniform(-1.2, 1.2)
+                by += random.uniform(-1.2, 1.2)
+                self._page.mouse.move(bx, by)
+                time.sleep(total / steps * random.uniform(0.6, 1.5))
+            self._page.mouse.move(x, y)
+            self._mouse_xy = (x, y)
+        except Exception:
+            try:
+                self._page.mouse.move(x, y)
+                self._mouse_xy = (x, y)
+            except Exception:
+                pass
+
+    def _click_challenge(self, st=None):
+        """采用上游滚轮/鼠标点击，同时保留付费拦截与 API 暂停边界。"""
+        if self._api_checkpoint() or self._stop.is_set() or self._paused:
+            return None
+        try:
+            for _ in range(7):
+                target = self._eval(r"""() => {
+                    const b = document.querySelector('[class*="challengeButton"]');
+                    if (!b) return null;
+                    const r = b.getBoundingClientRect(), style = getComputedStyle(b);
+                    if (r.width < 1 || r.height < 1 || style.visibility === 'hidden' ||
+                        style.display === 'none' || b.disabled) return null;
+                    const text = (b.innerText || '').replace(/\n/g, ' ').trim();
+                    if (/(鱼翅|送出礼物|充值|付费|支付|礼物)/.test(text))
+                        return {blocked: true, text};
+                    return {x: r.left + r.width / 2, y: r.top + r.height / 2,
+                        height: innerHeight, width: innerWidth, text};
+                }""")
+                if self._api_checkpoint() or self._stop.is_set():
+                    return None
+                if not target:
+                    return None
+                if target.get('blocked'):
+                    return {'ok': False, 'why': 'paid-button-blocked', 'text': target['text']}
+                if 0 < target['y'] < target['height'] and 0 < target['x'] < target['width']:
+                    self._human_move(target['x'], target['y'])
+                    if self._api_checkpoint() or self._stop.is_set():
+                        return None
+                    # 弹窗可能在移动期间出现；不能点击同一坐标下的付费弹窗。
+                    clear = self._eval("""({x, y}) => {
+                        const el = document.elementFromPoint(x, y);
+                        const b = el && el.closest('[class*="challengeButton"]');
+                        return !!b && !b.disabled && !/(鱼翅|送出礼物|充值|付费|支付|礼物)/.test(b.innerText || '');
+                    }""", {'x': target['x'], 'y': target['y']})
+                    if self._api_checkpoint() or self._stop.is_set() or not clear:
+                        return None
+                    self._page.mouse.click(target['x'], target['y'], delay=random.randint(30, 90))
+                    self._api_checkpoint()
+                    return {'ok': True, 'text': target['text']}
+                self._page.mouse.move(target['width'] / 2, target['height'] / 2)
+                self._page.mouse.wheel(0, random.randint(420, 680) * (1 if target['y'] > 0 else -1))
+                usleep(0.4)
+            return None
+        except Exception as exc:
+            self._log('鼠标点击挑战失败：%s' % str(exc)[:120], 'warn')
+            return None
 
     def _gate_challenge(self, st, wait_s=25):
         """开局闸门：免费 → 直接开；免费用尽 → 银币够则开（银币免费获取），否则停止。
@@ -1827,7 +1956,7 @@ class GuardFishBot:
         if self._stop.is_set():
             return False, info
         self._api_monitor.arm('开局选卡')
-        r = self._click(JS_CLICK_CHALLENGE)
+        r = self._click_challenge(st)
         if isinstance(r, dict) and not r.get("ok"):
             self._log("已拦截疑似付费挑战按钮：%s" % (r.get("text") or r.get("why") or "未知"), "warn")
             return False, info
@@ -1837,7 +1966,7 @@ class GuardFishBot:
             return False, info
         # 标记本场开始时间，回血守护按用户设置的单场时限收手。
         try:
-            self._page.evaluate("() => { if (window.__GF) { window.__GF.battleT0 = Date.now(); window.__GF.capped = false; window.__GF.oneHitKills = 0; } }")
+            self._eval("() => { if (window.__GF) { window.__GF.battleT0 = Date.now(); window.__GF.capped = false; window.__GF.oneHitKills = 0; } }")
         except Exception:
             pass
         last_click = time.time()
@@ -1864,7 +1993,7 @@ class GuardFishBot:
                 else:
                     self._log("开局超时：%ds 内无任何进展" % PRE_BATTLE_LIMIT, "warn")
                 break
-            time.sleep(0.8)
+            usleep(0.8)
             st = self._state()
             if not st:
                 continue
@@ -1874,11 +2003,19 @@ class GuardFishBot:
                 self._click(JS_CLOSE_LIMIT_ALTER)
                 self._log("卡组不足提示：需要 9 张出战卡（请到编队里配满）", "warn")
                 last_progress = time.time()
-                time.sleep(1)
+                usleep(1)
                 continue
 
             cards = st.get("skillPanel")
             if cards:
+                if self.random_skills and st.get("skillPanelKind") == "starter":
+                    rr = self._click(JS_CLICK_RANDOM_SKILL)
+                    if isinstance(rr, dict) and rr.get("ok"):
+                        self._log("前置技能三选一 → 一键随机选择")
+                        info["skills"].append({"text": "一键随机选择", "random": True})
+                        last_progress = time.time()
+                        usleep(1.8)
+                        continue
                 texts = [c.get("txt", "") for c in cards]
                 scores = [score_skill_text(t) for t in texts]
                 best = scores.index(max(scores))
@@ -1887,7 +2024,7 @@ class GuardFishBot:
                 if got:
                     info["skills"].append({"text": texts[best][:80], "score": max(scores)})
                 last_progress = time.time()
-                time.sleep(2.0)
+                usleep(2.0)
                 continue
 
             if st.get("finalSkillList"):
@@ -1913,7 +2050,7 @@ class GuardFishBot:
                     else:
                         final_fail_why = "no-skillList"
                         self._log("技能确认列表未能开始：页面未找到 Starter-module_skillList", "warn")
-                time.sleep(1.0)
+                usleep(1.0)
                 continue
 
             if st.get("inBattle"):
@@ -1921,7 +2058,7 @@ class GuardFishBot:
             if st.get("result") or st.get("treasure"):
                 self._log("战斗未开始即出现结算？", "warn")
                 self._click(JS_RESULT_BTN)
-                time.sleep(1.5)
+                usleep(1.5)
                 continue
 
             # 仍停在主页面：点击可能落空（按钮未就绪/被拦截）→ 重试
@@ -1930,8 +2067,8 @@ class GuardFishBot:
                     if not self._wait_if_paused():
                         return False, info
                     return self._try_start_battle()
-                r2 = self._click(JS_CLICK_CHALLENGE)
-                if r2:
+                r2 = self._click_challenge(st)
+                if r2 and r2.get('ok'):
                     clicks += 1
                     last_click = time.time()
                     last_progress = time.time()
@@ -1941,6 +2078,7 @@ class GuardFishBot:
 
     def _goto_game(self):
         self._log("打开游戏页：房间 %s" % self.rid)
+        self._network = NetworkState()
         # 页面导航会清掉动态引擎模块；下一步按当前开关决定是否重新装载。
         self._runtime_script_loaded = False
         self._runtime_applied = None
@@ -1948,13 +2086,6 @@ class GuardFishBot:
             self._page.goto(GAME_URL.format(rid=self.rid), wait_until="domcontentloaded", timeout=90000)
         except Exception as e:
             self._log("页面加载异常：%s" % str(e)[:150], "warn")
-        # 兜底：确保 hook 存在（add_init_script 通常已注入）
-        try:
-            has = self._page.evaluate("() => !!window.__WM")
-            if not has:
-                self._page.evaluate(JS_HOOK)
-        except Exception:
-            pass
         self._apply_hp_config()
         self._wait_ready(60)
         # 等 panelInfo 真正返回后再判断登录态
@@ -1963,13 +2094,10 @@ class GuardFishBot:
         while time.time() - t0 < 45:
             if self._stop.is_set():
                 return False
-            try:
-                info = self._page.evaluate(
-                    "() => window.__WM && window.__WM.panelInfo ? {code: window.__WM.panelInfo.code, "
-                    "nick: (window.__WM.panelInfo.data && window.__WM.panelInfo.data.userInfo && "
-                    "window.__WM.panelInfo.data.userInfo.nn) || ''} : null")
-            except Exception:
-                info = None
+            self._state()  # 同步驱动需要页面调用来分派新到达的响应回调。
+            info = ({"code": self._network.values.get("panelCode"),
+                     "nick": self._network.values.get("nick", "")}
+                    if "panelCode" in self._network.values else None)
             if info:
                 code = info.get("code")
                 if info.get("nick"):
@@ -2011,7 +2139,11 @@ class GuardFishBot:
         if self._api_checkpoint() or self._paused or self._stop.is_set():
             return None
         try:
-            result = self._page.evaluate(js, args[0]) if args else self._page.evaluate(js)
+            if js in (JS_CLICK_SKILL, JS_CLICK_RANDOM_SKILL, JS_CLICK_FINAL_START, JS_RESULT_BTN):
+                time.sleep(random.uniform(0.4, 1.2))
+                if self._api_checkpoint() or self._paused or self._stop.is_set():
+                    return None
+            result = self._eval(js, args[0]) if args else self._eval(js)
             self._api_checkpoint()
             return result
         except Exception as e:
@@ -2056,6 +2188,9 @@ class GuardFishBot:
                 self.status["state"] = "未登录"
                 return
             self._refresh_daily_progress(force=True)
+            self._log("活跃休息：%s；开局随机选技：%s" %
+                      (("累计 %.0f 分钟后休息 %.0f 分钟" % (self.daily_limit_min, self.rest_min))
+                       if self.daily_limit_min else "关", "开" if self.random_skills else "关"))
 
             while True:
                 if self._pause_requested and self._is_lobby(self._state() or {}):
@@ -2066,8 +2201,15 @@ class GuardFishBot:
                     break
                 if self._stop.is_set():
                     break
+                if self._is_lobby(self._state() or {}) and self._activity.due(self.daily_limit_min):
+                    if not self._long_rest():
+                        break
                 self.status["round"] = i
-                r = self._one_battle(i)
+                self._activity.start()
+                try:
+                    r = self._one_battle(i)
+                finally:
+                    self._activity.stop()
                 if r is None:
                     self._log("第%d场未能完成，停止。" % i, "error")
                     break
@@ -2130,6 +2272,25 @@ class GuardFishBot:
                         pass
                     setattr(self, attr, None)
 
+    def _long_rest(self):
+        self._api_monitor.suspend()
+        self._unload_runtime_script()
+        self._activity.begin_rest(self.rest_min)
+        self._log('已达活跃时长 %.0f 分钟，本场已结束；休息约 %.0f 分钟后继续，场数保留。' %
+                  (self.daily_limit_min, max(0, self._activity.rest_until - time.time()) / 60), 'warn')
+        while time.time() < self._activity.rest_until:
+            if self._stop.is_set():
+                return False
+            if self._pause_requested and not self._wait_if_paused():
+                return False
+            self.status['state'] = '活跃休息（剩余 %.0f 分钟）' % (
+                max(0, self._activity.rest_until - time.time()) / 60)
+            self._stop.wait(min(0.5, max(0, self._activity.rest_until - time.time())))
+        self._activity.finish_rest()
+        self.status['state'] = '准备开局'
+        self._log('休息结束，继续剩余场次。')
+        return not self._stop.is_set()
+
     def _sleep_gap(self):
         if self._pause_requested:
             return
@@ -2137,7 +2298,10 @@ class GuardFishBot:
         if hi <= 0:
             return
         sec = random.uniform(max(lo, 1), max(hi, 2))
-        self._log("场间等待 %.0f 秒…" % sec)
+        extra = not self.finish_fast and random.random() < 0.12
+        if extra:
+            sec += random.uniform(40, 150)
+        self._log("场间等待 %.0f 秒…%s" % (sec, "（随机延长）" if extra else ""))
         t0 = time.time()
         while time.time() - t0 < sec:
             if self._stop.is_set() or self._pause_requested:
@@ -2189,7 +2353,7 @@ class GuardFishBot:
             if st.get("result") or st.get("treasure"):
                 r = self._click(JS_RESULT_BTN)
                 self._log("清理残留弹窗：%s" % r)
-                time.sleep(1.2)
+                usleep(1.2)
                 continue
             if st.get("finalSkillList"):
                 r = self._click(JS_CLICK_FINAL_START)
@@ -2198,7 +2362,7 @@ class GuardFishBot:
                 else:
                     self._log("残留的技能确认列表 → 未能开始（%s）"
                               % ((r or {}).get("why") if isinstance(r, dict) else "no-skillList"), "warn")
-                time.sleep(1.5)
+                usleep(1.5)
                 continue
             break
 
@@ -2219,6 +2383,7 @@ class GuardFishBot:
             try:
                 self._runtime_script_loaded = False
                 self._runtime_applied = None
+                self._network = NetworkState()
                 self._page.reload(wait_until="domcontentloaded", timeout=60000)
                 self._wait_ready(60)
                 self._apply_hp_config()
@@ -2253,7 +2418,7 @@ class GuardFishBot:
         activity_watch = ActivityWatch()
         end_started = None
         try:
-            self._page.evaluate(JS_HP_DRAIN)      # 清掉上一场的残留事件
+            self._eval(JS_HP_DRAIN)      # 清掉上一场的残留事件
         except Exception:
             pass
         while True:
@@ -2305,7 +2470,7 @@ class GuardFishBot:
 
             # 血条守护：回收事件（回血/掉血）
             try:
-                gf = self._page.evaluate(JS_HP_DRAIN)
+                gf = self._eval(JS_HP_DRAIN)
             except Exception:
                 gf = None
             if gf:
@@ -2375,7 +2540,7 @@ class GuardFishBot:
             if st.get("inBattle") and not snap_done:
                 snap_done = True
                 try:
-                    html = self._page.evaluate(JS_HUD_HTML)
+                    html = self._eval(JS_HUD_HTML)
                     if html:
                         with open(os.path.join(LOGDIR, "hud_sample.html"), "w", encoding="utf-8") as f:
                             f.write(html)
@@ -2389,6 +2554,7 @@ class GuardFishBot:
             self.status["hp"] = shown_hp
             if el - last_hud >= 60:
                 last_hud = el
+                self._activity.checkpoint()
                 self._log("进行中 t=%ss 第%s关 HP=%s 免费剩余=%s 回血=%d%s｜杀敌=%s"
                           % (el, stage.get("curStage", "?"), shown_hp,
                              wm.get("freeNum", "?"), hp_refill_count,
@@ -2403,12 +2569,12 @@ class GuardFishBot:
                 self._log("%s弹窗 → %s %s" %
                           ("结算候选" if modal_result else "奖励",
                            r, ("｜" + candidate_result_text[:120]) if candidate_result_text else ""))
-                time.sleep(2.0)
+                usleep(2.0)
                 st2 = self._state() or {}
                 if st2.get("treasure"):
                     r2 = self._click(JS_RESULT_BTN)
                     self._log("奖励弹窗 → %s" % r2)
-                    time.sleep(1.5)
+                    usleep(1.5)
                 st3 = self._state() or {}
                 wm3 = st3.get("wm") or {}
                 battle_over_after = bool(wm3.get("battleOver"))
@@ -2449,7 +2615,7 @@ class GuardFishBot:
                 result = self._click(JS_CLICK_FINAL_START)
                 if isinstance(result, dict) and result.get("ok"):
                     self._log("技能确认列表 → 已点击开始战斗，继续当前场监控")
-                time.sleep(1.0)
+                usleep(1.0)
                 continue
 
             # 3.2 关卡技能三选一
@@ -2463,7 +2629,7 @@ class GuardFishBot:
                 got = self._click(JS_CLICK_SKILL, best)
                 if got:
                     skills_chosen.append({"text": texts[best][:80], "score": max(scores)})
-                time.sleep(2.2)
+                usleep(2.2)
                 continue
 
             # 3.3 每周宝箱领取（免费）
@@ -2472,12 +2638,12 @@ class GuardFishBot:
                 r = self._click(JS_HUD_CLAIM)
                 if r:
                     self._log("领取战斗宝箱")
-                    time.sleep(1.5)
+                    usleep(1.5)
                     st2 = self._state() or {}
                     if st2.get("treasure"):
                         self._click(JS_RESULT_BTN)
                         self._log("宝箱奖励弹窗已关闭")
-                        time.sleep(1.0)
+                        usleep(1.0)
 
 
         dur = time.time() - t_battle0
@@ -2494,7 +2660,7 @@ class GuardFishBot:
             st = self._state() or {}
             if st.get("result") or st.get("treasure"):
                 self._click(JS_RESULT_BTN)
-                time.sleep(1.5)
+                usleep(1.5)
             else:
                 break
 
@@ -2536,6 +2702,7 @@ class GuardFishBot:
                 self._snap("battle_inactive")
                 self._runtime_script_loaded = False
                 self._runtime_applied = None
+                self._network = NetworkState()
                 self._page.reload(wait_until="domcontentloaded", timeout=60000)
                 self._wait_ready(60)
                 self._apply_runtime_controls(force=True)
@@ -2563,6 +2730,7 @@ class GuardFishBot:
             self._log("刷新页面恢复…", "warn")
             self._runtime_script_loaded = False
             self._runtime_applied = None
+            self._network = NetworkState()
             self._page.reload(wait_until="domcontentloaded", timeout=60000)
             ok = self._wait_ready(60)
             try:
@@ -2584,35 +2752,194 @@ class GuardFishBot:
 
 
 # ---------------------------------------------------------------- 登录
-def open_login(rid=DEFAULT_RID):
-    """拉起持久化浏览器到斗鱼首页，供用户手动登录；关闭窗口后返回"""
+def page_login_state(page):
+    """从页面内容判断登录态。
+
+    为什么要这么绕：未登录时游戏页也会渲染一个占位按钮「开启挑战 0」
+    （canChallenge=True），所以「按钮存在」或「按钮含数字」都不能当登录成功的依据。
+    真正的信号是页面有没有加载出账号数据（周天梯/关卡），或者干脆显示「加载失败」。
+
+    返回 (state, detail)：'ok' 已登录 / 'no' 未登录 / None 还在加载
+    """
+    try:
+        d = page.evaluate("""() => {
+            const b = document.querySelector('[class*="challengeButton"]');
+            const btn = b ? (b.innerText || '').split(String.fromCharCode(10)).join(' ').trim() : '';
+            const body = (document.body.innerText || '').slice(0, 400);
+            return {btn: btn, body: body};
+        }""")
+    except Exception:
+        return None, ""
+    btn = (d.get("btn") or "").strip()
+    body = d.get("body") or ""
+    if "加载失败" in body or "用户未登录" in body:
+        return "no", body[:60]
+    has_data = ("周天梯" in body) or ("图鉴" in body) or ("关" in btn)
+    if has_data and ("关" in btn or "周天梯" in body):
+        return "ok", (btn or "已登录")
+    return None, btn
+
+
+def await_login_state(page, timeout=45, stable=5):
+    """轮询页面登录态；「已登录」必须**连续稳定** stable 秒才认可。
+
+    为什么要求稳定：游戏页会先用浏览器缓存渲染一次旧画面（可能短暂显示「周天梯」和
+    占位按钮「开启挑战 0」），随后接口失败才切成「加载失败」。单点采样会把这种
+    瞬时脏渲染误判成「已登录」——实测踩过。
+    返回 (ok, detail)
+    """
+    t0 = time.time()
+    ok_cnt = 0
+    no_cnt = 0
+    detail = ""
+    while time.time() - t0 < timeout:
+        st, d = page_login_state(page)
+        if d:
+            detail = d
+        if st == "ok":
+            ok_cnt += 1
+            no_cnt = 0
+            if ok_cnt >= stable:
+                return True, detail
+        elif st == "no":
+            no_cnt += 1
+            ok_cnt = 0
+            if no_cnt >= 2:          # 明确「加载失败」连续 2 次即判定未登录
+                return False, detail
+        else:
+            ok_cnt = no_cnt = 0
+        time.sleep(1)
+    return False, detail
+
+
+def open_login(rid=DEFAULT_RID, on_log=None):
+    """拉起浏览器登录，并在登录过程中实时检测是否真的登录成功。
+
+    改进点（旧版只说「窗口已关闭」，登录失败也看不出来）：
+      1. 先开斗鱼首页（有明确的「登录」入口；直接开游戏页只会显示“加载失败”）。
+      2. 盯 acf_auth 这个登录凭据的变化——一变化就自动跳到游戏页确认，
+         确认成功立刻打「✅ 登录成功」，提示用户可以关窗口。
+      3. 判定不是看按钮存在与否（未登录时也有占位按钮「开启挑战 0」），
+         而是要求页面**连续稳定**显示真实关卡（见 await_login_state）。
+      4. 关窗口前再复核一次，明确告知登录态到底有没有保存。
+    返回 True/False（是否确认登录成功）。
+    """
+    emit = on_log or log_msg
     ensure_dirs()
-    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+    DRIVER_NAME, sync_playwright, PWTimeoutError = pick_driver()
     kill_stale_chrome(PROFILE)
     clean_profile_locks(PROFILE)
-    log_msg("打开浏览器，请完成登录…")
+    emit("打开浏览器，请完成登录…（驱动：%s）" % DRIVER_NAME)
+
+    state = {"code": None, "nick": "", "msg": ""}
+    logged = False
+    login_detail = ""
     with sync_playwright() as pw:
         ctx, exe = launch_persistent(pw, PROFILE, headless=False)
-        log_msg("浏览器：%s" % exe)
+        emit("浏览器：%s" % exe)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
+
+        def _on_resp(resp):
+            try:
+                if "basics/panelInfo" not in resp.url:
+                    return
+                j = json.loads(resp.text())
+                state["code"] = j.get("code")
+                state["msg"] = str(j.get("msg") or "")
+                u = ((j.get("data") or {}).get("userInfo") or {})
+                if u.get("nn"):
+                    state["nick"] = u["nn"]
+            except Exception:
+                pass
+
+        page.on("response", _on_resp)
+        # 先开首页（首页有明确的「登录」入口，未登录时不会只显示“加载失败”）
         try:
             page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
         except Exception:
             pass
-        t0 = time.time()
-        while time.time() - t0 < 600:
+        emit("请扫码登录。登录成功后本程序会提示「登录成功」，届时再关闭浏览器窗口。")
+
+        def _acf():
+            """当前 acf_auth（登录凭据）。用变化来判断「刚刚登录成功」——"""
             try:
-                ctx.wait_for_event("close", timeout=5000)
+                for c in ctx.cookies():
+                    if c.get("name") == "acf_auth" and "douyu" in (c.get("domain") or ""):
+                        return c.get("value") or ""
+            except Exception:
+                pass
+            return ""
+
+        checked_acf = ""
+        t0 = time.time()
+        last_tip = 0.0
+        while time.time() - t0 < 600:
+            # 首页没有 panelInfo，靠登录凭据变化触发一次「跳到游戏页用 DOM 确认」
+            if not logged:
+                cur = _acf()
+                if cur and cur != checked_acf:
+                    checked_acf = cur
+                    emit("检测到新的登录凭据，正在确认…")
+                    try:
+                        page.goto(GAME_URL.format(rid=rid),
+                                  wait_until="domcontentloaded", timeout=60000)
+                        ok2, det2 = await_login_state(page, timeout=30, stable=3)
+                    except Exception as e:
+                        ok2, det2 = False, ""
+                        emit("确认失败：%s" % str(e)[:100], "warn")
+                    if ok2:
+                        logged = True
+                        login_detail = det2
+                        emit("✅ 登录成功：%s（现在可以关闭浏览器窗口了）" % det2)
+                    else:
+                        emit("登录凭据已更新，但游戏页仍不可用（%s），正在退回登录页，请重试"
+                                % (state["code"] or "页面加载失败"), "warn")
+                        try:
+                            page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
+                        except Exception:
+                            pass
+            if not logged and (time.time() - last_tip) > 20:
+                last_tip = time.time()
+                emit("仍在等待登录…（%s）"
+                        % ("服务端返回未登录" if state["code"] == 1002 else "等待扫码"), "warn")
+            try:
+                ctx.wait_for_event("close", timeout=2000)
                 break
             except PWTimeoutError:
-                continue
+                pass
             except Exception:
                 break
+
+        # 关窗之前做最后一次确认：切到游戏页，稳定判定
+        if not logged:
+            try:
+                emit("正在复核登录态…")
+                page.goto(GAME_URL.format(rid=rid), wait_until="domcontentloaded", timeout=60000)
+                ok2, det2 = await_login_state(page, timeout=30, stable=3)
+                if ok2:
+                    logged = True
+                    login_detail = det2
+                    emit("✅ 登录成功：%s" % det2)
+            except Exception as e:
+                emit("复核失败：%s" % str(e)[:100], "warn")
+
         try:
             ctx.close()
         except Exception:
             pass
-    log_msg("登录窗口已关闭。登录态保存在：%s" % PROFILE)
+        time.sleep(0.8)      # 给 Chrome 一点时间把 cookie 落盘
+
+    if logged:
+        emit("✅ 登录成功并已保存（%s）。现在可以点「开始挂机」了。" % (login_detail or "已登录"))
+    else:
+        if state["code"] == 1002:
+            emit("登录未完成：服务端仍返回「用户未登录」（code 1002）。"
+                    "常见原因：① 扫码后没等跳转就关了窗口；② 同一账号在别处登录，"
+                    "把这里的会话挤掉了。请重新点「登录斗鱼」，等到提示「登录成功」再关窗口。", "error")
+        else:
+            emit("未检测到登录成功（%s）。请重新点「登录斗鱼」再试一次。"
+                    % (state["code"] or "游戏页显示加载失败"), "error")
+    return logged
 
 
 # ---------------------------------------------------------------- selftest
@@ -2641,10 +2968,10 @@ def selftest():
             emit("  rank=%d %s | %s" % (r, n, p))
     except Exception as e:
         emit("chrome_candidates FAIL: %s" % str(e)[:300])
-    emit("import playwright ...")
+    emit("import browser driver ...")
     try:
-        from playwright.sync_api import sync_playwright
-        emit("playwright import: OK")
+        driver_name, sync_playwright, _timeout = pick_driver()
+        emit("%s import: OK" % driver_name)
         emit("sync_playwright().start() ...")
         with sync_playwright() as pw:
             emit("driver started")
@@ -2674,14 +3001,18 @@ def main(default_debug=False):
     ap.add_argument("--rounds", type=int, default=10, help="场数（0=不限，打完免费次数后银币够就继续）")
     ap.add_argument("--gap-min", type=float, default=5, help="场间最小间隔秒")
     ap.add_argument("--gap-max", type=float, default=15, help="场间最大间隔秒")
+    ap.add_argument("--daily-limit", type=float, default=240, help="累计活跃分钟后休息，0=关闭")
+    ap.add_argument("--rest-min", type=float, default=90, help="每次休息分钟，默认 90")
+    ap.add_argument("--no-random-skills", action="store_true", help="不开一键随机选技，沿用评分选卡")
+    ap.add_argument("--no-block-stats", action="store_true", help="保留斗鱼通用统计 GIF 请求")
     ap.add_argument("--headless", action="store_true", help="无头模式")
     ap.add_argument("--no-claim", action="store_true", help="不自动领取战斗宝箱")
     ap.add_argument("--no-hp", action="store_true", help="关闭「血量低于阈值自动回满」")
     ap.add_argument("--hp-threshold", type=int, default=5, help="回血阈值（血量低于该值回满，默认 5）")
     ap.add_argument("--no-coin", action="store_true", help="免费用尽后不用银币续打（默认会用，银币为免费获取）")
     ap.add_argument("--one-hit", action="store_true", help="秒杀模式：我方卡牌伤害直接击杀怪物")
-    ap.add_argument("--one-hit-mode", choices=("full", "probability", "multiplier", "fixed_attack"), default="full",
-                    help="秒杀策略：full=全额，probability=概率，multiplier=攻击倍率，fixed_attack=固定攻击力")
+    ap.add_argument("--one-hit-mode", choices=("full", "probability", "multiplier", "fixed_attack", "gentle"), default="full",
+                    help="秒杀策略：full=全额，probability=概率，multiplier=攻击倍率，fixed_attack=固定攻击力，gentle=上游温和伤害")
     ap.add_argument("--one-hit-probability", type=float, default=50.0,
                     help="概率秒杀触发概率（0~100，默认 50）")
     ap.add_argument("--attack-multiplier", type=float, default=2.0,
@@ -2776,7 +3107,9 @@ def main(default_debug=False):
                            attack_multiplier=args.attack_multiplier,
                            attack_fixed=args.attack_fixed, finish_fast=args.finish_fast,
                            debug=args.debug,
-                           combat_controls=combat)
+                           combat_controls=combat, daily_limit_min=args.daily_limit,
+                           rest_min=args.rest_min, random_skills=not args.no_random_skills,
+                           block_stats=not args.no_block_stats)
         bot.add_log_sink(sink)
         start_desc = "命令行挂机启动：房间=%s 场数=%d" % (args.rid, args.rounds)
         if args.headless:
