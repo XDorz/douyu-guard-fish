@@ -1,0 +1,91 @@
+name: Build API observer lab
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - api-observer-lab
+
+permissions:
+  contents: read
+
+concurrency:
+  group: api-observer-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate observer version
+        id: version
+        shell: bash
+        run: |
+          version=$(tr -d '\r\n' < API_LAB_VERSION)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "API_LAB_VERSION must be x.y.z"; exit 1; }
+          tag="api-lab-v$version"
+          if git rev-parse --verify "refs/tags/$tag" >/dev/null 2>&1; then
+            [[ "$(git rev-parse "refs/tags/$tag^{commit}")" == "$(git rev-parse HEAD)" ]] || { echo "Bump API_LAB_VERSION before publishing"; exit 1; }
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install build dependencies
+        shell: pwsh
+        run: python -m pip install -r requirements.txt pyinstaller
+      - name: Run regression checks
+        shell: pwsh
+        run: python -m unittest discover -s tests -v
+      - name: Build API observer EXE
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          python -m PyInstaller --noconfirm --distpath out --workpath _build_tmp api_lab.spec
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = Get-ChildItem out -Filter *.exe | Select-Object -First 1
+          if (-not $exe) { throw "No EXE was built" }
+          Rename-Item -Path $exe.FullName -NewName ("guard-fish-{0}-win64.exe" -f $env:RELEASE_TAG)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: api-observer-lab
+          path: out/*.exe
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.build.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: api-observer-lab
+          path: release-assets
+      - name: Publish independent observer EXE
+        shell: bash
+        run: |
+          commit=$(git rev-parse HEAD)
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/*.exe --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/*.exe --target "$commit" \
+              --title "$RELEASE_TAG · 只读网络监听" --prerelease --latest=false \
+              --notes-file API_LAB_README.md
+          fi
